@@ -40,18 +40,26 @@ except Exception as e:
 app = Flask(__name__)
 
 # ── Helper: fetch rows from raw table ─────────────────────────────────
-def fetch_rows(limit: int):
-    query = (
-        f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{RAW_TABLE}` "
-        f"LIMIT {limit}"
-    )
-    try:
-        job = bq_client.query(query)
-        results = job.result()
-        return [dict(row) for row in results]
-    except GoogleAPIError as e:
-        logger.error(f"BigQuery fetch_rows error: {e}")
-        raise
+ def fetch_rows(limit: int):
+-    sql = f"SELECT * FROM `{PROJECT_ID}.{DATASET_ID}.{RAW_TABLE}` LIMIT {limit}"
++    sql = f\"\"\"
++      SELECT r.*
++      FROM `{PROJECT_ID}.{DATASET_ID}.{RAW_TABLE}` AS r
++      LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE}` AS s
++        ON r.name = s.name
++           AND r.domain = s.domain
++      WHERE s.name IS NULL
++      LIMIT {limit}
++    \"\"\"
+     try:
+-        job = bq.query(sql)
+-        return [dict(r) for r in job.result()]
++        job = bq.query(sql)
++        return [dict(r) for r in job.result()]
+     except GoogleAPIError as e:
+         logger.error(f"BigQuery fetch error: {e}")
+         raise
+
 
 # ── Helper: call OpenAI to extract JSON ───────────────────────────────
 def call_gpt(row: dict):

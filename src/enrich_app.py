@@ -176,20 +176,15 @@ Return _only_ JSON with the five keys.
 
 # ─── Core enrichment ─────────────────────────────────────────────────
 def enrich_row(row):
-    # 1) Try Ticketmaster
-    tm = get_ticketmaster_info(row["name"])
-    # 2) Try Google Places (fills avg_ticket_price, maybe capacity)
-    gp = get_google_places_info(row["name"])
-    # 3) Try Wikidata (fills capacity, annual_revenue)
-    wd = get_wikidata_info(row["name"])
-    # Merge
-    enriched = {**tm, **gp, **wd}
-    # 4) Fill any missing via GPT
-    missing_keys = [k for k,v in enriched.items() if v is None]
-    if missing_keys:
-        fallback = call_gpt_fallback(row)
-        enriched.update({k: fallback[k] for k in missing_keys})
-    return enriched
+    # --- DUMMY TEST ENRICHMENT ---
+    return {
+        "avg_ticket_price": 42.0,
+        "capacity": 1234,
+        "ticket_vendor": "TEST_VENDOR",
+        "annual_revenue": 999999.0,
+        "ticketing_revenue": 111111.0
+    }
+
 
 # ─── Write enriched row ───────────────────────────────────────────────
 def write_row(raw, enriched):

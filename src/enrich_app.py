@@ -11,6 +11,9 @@ from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError
 import openai
 
+print("Environment:", dict(os.environ))
+
+
 print("Booting enrich_app.py...")
 print("Environment:", dict(os.environ))  # Log all env vars
 

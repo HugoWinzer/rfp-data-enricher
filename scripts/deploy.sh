@@ -1,10 +1,8 @@
-cat > scripts/deploy.sh << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# You can override these by exporting beforehand
-PROJECT_ID="${PROJECT_ID:-rfp-database-464609}"
-DATASET_ID="${DATASET_ID:-rfpdata}"
+# No API keys or secrets hard-coded here!
+
 SERVICE="data-enricher"
 IMAGE="gcr.io/$PROJECT_ID/$SERVICE:latest"
 
@@ -17,8 +15,6 @@ gcloud run deploy "$SERVICE" \
   --platform managed \
   --region us-central1 \
   --allow-unauthenticated \
-  --set-env-vars \
-"PROJECT_ID=$PROJECT_ID,DATASET_ID=$DATASET_ID,RAW_TABLE=performing_arts_raw,STAGING_TABLE=performing_arts_enriched_staging,OPENAI_API_KEY=$OPENAI_API_KEY"
+  --set-env-vars PROJECT_ID=$PROJECT_ID,DATASET_ID=$DATASET_ID,RAW_TABLE=$RAW_TABLE,STAGING_TABLE=$STAGING_TABLE,OPENAI_API_KEY=$OPENAI_API_KEY,TICKETMASTER_KEY=$TICKETMASTER_KEY,GOOGLE_PLACES_KEY=$GOOGLE_PLACES_KEY
 
 echo "✅ Deployment complete"
-EOF

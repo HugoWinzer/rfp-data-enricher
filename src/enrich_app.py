@@ -197,6 +197,7 @@ def enrich_row(row):
             enriched[k] = gpt_result.get(k)
     return enriched
 
+
 # ─── Write enriched row ───────────────────────────────────────────────
 def write_row(raw, enriched):
     rec = raw.copy()

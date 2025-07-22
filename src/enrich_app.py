@@ -47,11 +47,9 @@ bq = bigquery.Client(project=PROJECT_ID)
 # ─── Helper: fetch raw rows ──────────────────────────────────────────
 def fetch_rows(limit: int):
     sql = f"""
-      SELECT r.*
-      FROM `{PROJECT_ID}.{DATASET_ID}.{RAW_TABLE}` AS r
-      LEFT JOIN `{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE}` AS s
-        ON r.name = s.name AND r.domain = s.domain
-      WHERE s.name IS NULL
+      SELECT *
+      FROM `{PROJECT_ID}.{DATASET_ID}.{RAW_TABLE}`
+      WHERE enrichment_status IS NULL
       LIMIT {limit}
     """
     try:
@@ -60,6 +58,7 @@ def fetch_rows(limit: int):
     except GoogleAPIError as e:
         logger.error(f"BigQuery fetch error: {e}")
         raise
+
 
 # ─── Google Places lookup ───────────────────────────────────────────
 def get_google_places_info(name, domain=None):

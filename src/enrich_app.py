@@ -11,6 +11,9 @@ from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError
 import openai
 
+print("Booting enrich_app.py...")
+print("Environment:", dict(os.environ))  # Log all env vars
+
 # ─── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -196,7 +199,6 @@ def enrich_row(row):
         for k in missing:
             enriched[k] = gpt_result.get(k)
     return enriched
-
 
 # ─── Write enriched row ───────────────────────────────────────────────
 def write_row(raw, enriched):

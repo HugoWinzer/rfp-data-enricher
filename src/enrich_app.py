@@ -18,21 +18,21 @@ logger = logging.getLogger()
 
 # ─── Env Vars ────────────────────────────────────────────────────────
 REQUIRED = [
-    "PROJECT_ID","DATASET_ID","RAW_TABLE","STAGING_TABLE","OPENAI_API_KEY",
-    "TICKETMASTER_KEY","GOOGLE_PLACES_KEY"
+    "PROJECT_ID", "DATASET_ID", "RAW_TABLE", "STAGING_TABLE",
+    "OPENAI_API_KEY", "TICKETMASTER_KEY", "GOOGLE_PLACES_KEY"
 ]
 missing = [v for v in REQUIRED if v not in os.environ]
 if missing:
     logger.error(f"Missing env vars: {missing}")
     sys.exit(1)
 
-PROJECT_ID        = os.environ["PROJECT_ID"]
-DATASET_ID        = os.environ["DATASET_ID"]
-RAW_TABLE         = os.environ["RAW_TABLE"]
-STAGING_TABLE     = os.environ["STAGING_TABLE"]
-openai.api_key    = os.environ["OPENAI_API_KEY"]
-TM_KEY            = os.environ["TICKETMASTER_KEY"]
-PLACES_KEY        = os.environ["GOOGLE_PLACES_KEY"]
+PROJECT_ID = os.environ["PROJECT_ID"]
+DATASET_ID = os.environ["DATASET_ID"]
+RAW_TABLE = os.environ["RAW_TABLE"]
+STAGING_TABLE = os.environ["STAGING_TABLE"]
+openai.api_key = os.environ["OPENAI_API_KEY"]
+TM_KEY = os.environ["TICKETMASTER_KEY"]
+PLACES_KEY = os.environ["GOOGLE_PLACES_KEY"]
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
 
 # ─── BigQuery client ─────────────────────────────────────────────────
@@ -55,66 +55,72 @@ def fetch_rows(limit: int):
         logger.error(f"BigQuery fetch error: {e}")
         raise
 
-# ─── Ticketmaster lookup ────────────────────────────────────────────
-def get_ticketmaster_info(name):
-    url = (
-      f"https://app.ticketmaster.com/discovery/v2/venues.json"
-      f"?keyword={quote_plus(name)}&apikey={TM_KEY}"
-    )
-    try:
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        venues = data.get("_embedded", {}).get("venues", [])
-        if not venues:
-            return {}
-        v = venues[0]
-        return {
-          "ticket_vendor": "Ticketmaster",
-          # priceRanges is a list of {min, max, currency}
-          "avg_ticket_price": (
-            sum((pr.get("min",0)+pr.get("max",0))/2 for pr in v.get("priceRanges",[]))
-            / max(len(v.get("priceRanges",[])),1)
-          )
-        }
-    except Exception as e:
-        logger.warning(f"Ticketmaster lookup failed for {name}: {e}")
-        return {}
-
 # ─── Google Places lookup ───────────────────────────────────────────
-def get_google_places_info(name):
-    # find place_id
-    find_url = (
-      "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
-      f"?input={quote_plus(name)}&inputtype=textquery&fields=place_id&key={PLACES_KEY}"
-    )
+def get_google_places_info(name, domain=None):
     try:
-        resp = requests.get(find_url, timeout=5).json()
-        candidates = resp.get("candidates",[])
+        # Prefer domain if available
+        search_text = domain if domain else name
+        url = (
+            "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+            f"?input={quote_plus(search_text)}&inputtype=textquery&fields=place_id&key={PLACES_KEY}"
+        )
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        candidates = data.get("candidates", [])
         if not candidates:
             return {}
-        pid = candidates[0]["place_id"]
-        # get details
+        place_id = candidates[0]["place_id"]
+        # Get details
         details_url = (
-          "https://maps.googleapis.com/maps/api/place/details/json"
-          f"?place_id={pid}&fields=price_level,types&key={PLACES_KEY}"
+            "https://maps.googleapis.com/maps/api/place/details/json"
+            f"?place_id={place_id}&fields=price_level,types,user_ratings_total&key={PLACES_KEY}"
         )
-        det = requests.get(details_url, timeout=5).json().get("result",{})
-        # map price_level (0–4) to an approximate numeric USD price
+        details_resp = requests.get(details_url, timeout=10)
+        det = details_resp.json().get("result", {})
         price_level = det.get("price_level")
         avg_price = None
         if isinstance(price_level, int):
-            avg_price = float(price_level * 20) + 10  # e.g. "$"→30 USD
+            avg_price = float(price_level * 20) + 10  # crude mapping: $=30, $$=50, etc.
         return {
-          "avg_ticket_price": avg_price,
-          "capacity": None  # Google Places doesn’t give capacity; leave for GPT
+            "avg_ticket_price": avg_price,
+            "google_places_ratings": det.get("user_ratings_total")
         }
     except Exception as e:
         logger.warning(f"Google Places lookup failed for {name}: {e}")
         return {}
 
+# ─── Ticketmaster lookup ────────────────────────────────────────────
+def get_ticketmaster_info(name):
+    url = (
+        f"https://app.ticketmaster.com/discovery/v2/venues.json"
+        f"?keyword={quote_plus(name)}&apikey={TM_KEY}"
+    )
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        venues = data.get("_embedded", {}).get("venues", [])
+        if not venues:
+            return {}
+        v = venues[0]
+        # Try to extract average ticket price if priceRanges is available (rare)
+        price_ranges = v.get("priceRanges", [])
+        avg_price = None
+        if price_ranges:
+            avg_price = sum(
+                (pr.get("min", 0) + pr.get("max", 0)) / 2 for pr in price_ranges
+            ) / max(len(price_ranges), 1)
+        capacity = v.get("capacity")
+        return {
+            "ticket_vendor": "Ticketmaster",
+            "avg_ticket_price": avg_price,
+            "capacity": capacity
+        }
+    except Exception as e:
+        logger.warning(f"Ticketmaster lookup failed for {name}: {e}")
+        return {}
+
 # ─── Wikidata SPARQL lookup ──────────────────────────────────────────
 def get_wikidata_info(name):
-    # Try to fetch venue capacity (P1082) and annual revenue (P2139)
     sparql = f"""
 SELECT ?capacity ?revenue WHERE {{
   ?item rdfs:label "{name}"@en.
@@ -123,9 +129,13 @@ SELECT ?capacity ?revenue WHERE {{
 }} LIMIT 1
 """
     try:
-        headers = {"Accept":"application/sparql-results+json"}
-        r = requests.get(WIKIDATA_ENDPOINT, params={"query": sparql}, headers=headers, timeout=5).json()
-        row = r["results"]["bindings"][0]
+        headers = {"Accept": "application/sparql-results+json"}
+        r = requests.get(WIKIDATA_ENDPOINT, params={"query": sparql}, headers=headers, timeout=10)
+        results = r.json()
+        bindings = results["results"]["bindings"]
+        if not bindings:
+            return {}
+        row = bindings[0]
         cap = int(row["capacity"]["value"]) if "capacity" in row else None
         rev = float(row["revenue"]["value"]) if "revenue" in row else None
         return {"capacity": cap, "annual_revenue": rev}
@@ -136,68 +146,69 @@ SELECT ?capacity ?revenue WHERE {{
 # ─── GPT fallback ────────────────────────────────────────────────────
 def call_gpt_fallback(row):
     prompt = f"""
-You have partial data for a venue. Fill in the missing fields in JSON:
-  avg_ticket_price, capacity, ticket_vendor, annual_revenue, ticketing_revenue.
+Act as a data researcher. Provide as much accurate info as possible for this venue:
+Venue name: "{row['name']}"
 
-Known data:
-Name: {row['name']}
-Domain: {row.get('domain') or ''}
-Alt name: {row.get('alt_name') or ''}
-Category: {row.get('category') or ''}
-Short desc: {row.get('short_description') or ''}
-Full desc: {row.get('full_description') or ''}
-Phone: {row.get('phone_number') or ''}
-
-Also use these hints:
-- The “ticket_vendor” is often Ticketmaster or the venue’s official site.
-- If you have no data, return null.
-
-Return _only_ JSON with the five keys.
+Respond ONLY with a JSON object like:
+{{
+  "avg_ticket_price": [average single ticket price in USD, or null],
+  "capacity": [integer, or null],
+  "ticket_vendor": [string, or null],
+  "annual_revenue": [USD, or null],
+  "ticketing_revenue": [USD, or null]
+}}
+Do not include commentary, only valid JSON!
 """
     try:
         resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[
-              {"role":"system","content":"You are an expert data extractor."},
-              {"role":"user","content":prompt}
-            ],
-            temperature=0,
-            max_tokens=200
+            model="gpt-3.5-turbo",
+            messages=[{"role": "system", "content": prompt}],
+            max_tokens=150,
+            temperature=0.0,
         )
-        data = json.loads(resp.choices[0].message.content.strip())
-        # ensure keys exist
-        for k in ["avg_ticket_price","capacity","ticket_vendor","annual_revenue","ticketing_revenue"]:
+        raw = resp.choices[0].message['content']
+        logger.info(f"GPT raw output for '{row['name']}': {raw}")
+        data = json.loads(raw)
+        # Ensure all keys exist
+        for k in ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]:
             data.setdefault(k, None)
         return data
     except Exception as e:
-        logger.warning(f"GPT fallback failed: {e}")
+        logger.warning(f"GPT fallback failed for {row.get('name')}: {e}")
+        # Always return keys
         return {k: None for k in
-          ["avg_ticket_price","capacity","ticket_vendor","annual_revenue","ticketing_revenue"]}
+                ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]}
 
 # ─── Core enrichment ─────────────────────────────────────────────────
 def enrich_row(row):
-    # --- DUMMY TEST ENRICHMENT ---
-    return {
-        "avg_ticket_price": 42.0,
-        "capacity": 1234,
-        "ticket_vendor": "TEST_VENDOR",
-        "annual_revenue": 999999.0,
-        "ticketing_revenue": 111111.0
-    }
-
+    enriched = {}
+    # Try Google Places (by domain or name)
+    enriched.update(get_google_places_info(row.get("name"), row.get("domain")))
+    # Ticketmaster (by name)
+    enriched.update(get_ticketmaster_info(row.get("name")))
+    # Wikidata (by name)
+    enriched.update(get_wikidata_info(row.get("name")))
+    # Check for missing keys
+    missing = [k for k in ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]
+               if enriched.get(k) is None]
+    if missing:
+        gpt_result = call_gpt_fallback(row)
+        for k in missing:
+            enriched[k] = gpt_result.get(k)
+    return enriched
 
 # ─── Write enriched row ───────────────────────────────────────────────
 def write_row(raw, enriched):
     rec = raw.copy()
     rec.update(enriched)
     rec["enrichment_status"] = "DONE"
-    rec["last_updated"]     = datetime.datetime.utcnow().isoformat()
+    rec["last_updated"] = datetime.datetime.utcnow().isoformat()
     try:
         errs = bq.insert_rows_json(f"{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE}", [rec])
         if errs:
-            logger.error(f"Insert errors: {errs}")
+            logger.error(f"Insert errors for '{raw.get('name')}': {errs}")
     except Exception as e:
-        logger.error(f"BigQuery insert exception: {e}")
+        logger.error(f"BigQuery insert exception for '{raw.get('name')}': {e}")
 
 # ─── HTTP endpoint ───────────────────────────────────────────────────
 app = Flask(__name__)
@@ -205,7 +216,7 @@ app = Flask(__name__)
 @app.route("/", methods=["GET"])
 def run_batch():
     try:
-        limit = int(request.args.get("limit","10"))
+        limit = int(request.args.get("limit", "10"))
     except:
         return jsonify(error="invalid limit"), 400
 
@@ -218,6 +229,6 @@ def run_batch():
         processed += 1
     return jsonify(processed=processed, status="OK")
 
-if __name__=="__main__":
-    port = int(os.getenv("PORT",8080))
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)

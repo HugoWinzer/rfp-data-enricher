@@ -12,12 +12,10 @@ from google.api_core.exceptions import GoogleAPIError
 import openai
 from bs4 import BeautifulSoup
 
-# ─── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger()
 
-# ─── Env Vars ────────────────────────────────────────────────────────
 REQUIRED = [
     "PROJECT_ID", "DATASET_ID", "RAW_TABLE", "STAGING_TABLE",
     "OPENAI_API_KEY", "TICKETMASTER_KEY", "GOOGLE_PLACES_KEY"
@@ -35,13 +33,10 @@ openai.api_key = os.environ["OPENAI_API_KEY"]
 TM_KEY = os.environ["TICKETMASTER_KEY"]
 PLACES_KEY = os.environ["GOOGLE_PLACES_KEY"]
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
-
-# --- Eventbrite Credentials ---
 EVENTBRITE_TOKEN = "553UU7UT3NAMJOUNMRJ7"
 
 bq = bigquery.Client(project=PROJECT_ID)
 
-# ─── Helper: fetch raw rows ──────────────────────────────────────────
 def fetch_rows(limit: int):
     sql = f"""
       SELECT *
@@ -56,7 +51,6 @@ def fetch_rows(limit: int):
         logger.error(f"BigQuery fetch error: {e}")
         raise
 
-# ─── Google Places lookup ───────────────────────────────────────────
 def get_google_places_info(name, domain=None):
     try:
         search_text = domain if domain else name
@@ -68,7 +62,7 @@ def get_google_places_info(name, domain=None):
         data = resp.json()
         candidates = data.get("candidates", [])
         if not candidates:
-            return {}
+            return {}, {}
         place_id = candidates[0]["place_id"]
         details_url = (
             "https://maps.googleapis.com/maps/api/place/details/json"
@@ -80,15 +74,13 @@ def get_google_places_info(name, domain=None):
         avg_price = None
         if isinstance(price_level, int):
             avg_price = float(price_level * 20) + 10
-        return {
-            "avg_ticket_price": avg_price,
-            "google_places_ratings": det.get("user_ratings_total")
-        }
+        out = {"avg_ticket_price": avg_price} if avg_price is not None else {}
+        source = {"avg_ticket_price_source": "Google Places"} if avg_price is not None else {}
+        return out, source
     except Exception as e:
         logger.warning(f"Google Places lookup failed for {name}: {e}")
-        return {}
+        return {}, {}
 
-# ─── Ticketmaster lookup ────────────────────────────────────────────
 def get_ticketmaster_info(name):
     url = (
         f"https://app.ticketmaster.com/discovery/v2/venues.json"
@@ -99,7 +91,7 @@ def get_ticketmaster_info(name):
         data = r.json()
         venues = data.get("_embedded", {}).get("venues", [])
         if not venues:
-            return {}
+            return {}, {}
         v = venues[0]
         price_ranges = v.get("priceRanges", [])
         avg_price = None
@@ -108,16 +100,21 @@ def get_ticketmaster_info(name):
                 (pr.get("min", 0) + pr.get("max", 0)) / 2 for pr in price_ranges
             ) / max(len(price_ranges), 1)
         capacity = v.get("capacity")
-        return {
-            "ticket_vendor": "Ticketmaster",
-            "avg_ticket_price": avg_price,
-            "capacity": capacity
-        }
+        out = {}
+        source = {}
+        if avg_price is not None:
+            out["avg_ticket_price"] = avg_price
+            source["avg_ticket_price_source"] = "Ticketmaster"
+        if capacity is not None:
+            out["capacity"] = capacity
+            source["capacity_source"] = "Ticketmaster"
+        out["ticket_vendor"] = "Ticketmaster"
+        source["ticket_vendor_source"] = "Ticketmaster"
+        return out, source
     except Exception as e:
         logger.warning(f"Ticketmaster lookup failed for {name}: {e}")
-        return {}
+        return {}, {}
 
-# ─── Wikidata SPARQL lookup ──────────────────────────────────────────
 def get_wikidata_info(name):
     sparql = f"""
 SELECT ?capacity ?revenue WHERE {{
@@ -132,16 +129,21 @@ SELECT ?capacity ?revenue WHERE {{
         results = r.json()
         bindings = results["results"]["bindings"]
         if not bindings:
-            return {}
+            return {}, {}
         row = bindings[0]
-        cap = int(row["capacity"]["value"]) if "capacity" in row else None
-        rev = float(row["revenue"]["value"]) if "revenue" in row else None
-        return {"capacity": cap, "annual_revenue": rev}
+        out = {}
+        source = {}
+        if "capacity" in row:
+            out["capacity"] = int(row["capacity"]["value"])
+            source["capacity_source"] = "Wikidata"
+        if "revenue" in row:
+            out["annual_revenue"] = float(row["revenue"]["value"])
+            source["annual_revenue_source"] = "Wikidata"
+        return out, source
     except Exception as e:
         logger.warning(f"Wikidata lookup failed for {name}: {e}")
-        return {}
+        return {}, {}
 
-# ─── Eventbrite lookup ───────────────────────────────────────────────
 def get_eventbrite_info(name):
     try:
         headers = {"Authorization": f"Bearer {EVENTBRITE_TOKEN}"}
@@ -150,18 +152,20 @@ def get_eventbrite_info(name):
         data = resp.json()
         venues = data.get("venues", [])
         if not venues:
-            return {}
+            return {}, {}
         v = venues[0]
-        return {
-            "ticket_vendor": "Eventbrite",
-            "capacity": v.get("capacity"),
-            "eventbrite_id": v.get("id")
-        }
+        out = {}
+        source = {}
+        if v.get("capacity"):
+            out["capacity"] = v.get("capacity")
+            source["capacity_source"] = "Eventbrite"
+        out["ticket_vendor"] = "Eventbrite"
+        source["ticket_vendor_source"] = "Eventbrite"
+        return out, source
     except Exception as e:
         logger.warning(f"Eventbrite lookup failed for {name}: {e}")
-        return {}
+        return {}, {}
 
-# ─── Web Scraping for context ────────────────────────────────────────
 def scrape_venue_website(domain):
     if not domain:
         return ""
@@ -172,19 +176,19 @@ def scrape_venue_website(domain):
         resp = requests.get(url, timeout=10)
         soup = BeautifulSoup(resp.text, "html.parser")
         texts = soup.stripped_strings
-        text = " ".join(list(texts)[:300])  # Take first 300 text chunks for prompt
+        text = " ".join(list(texts)[:300])
         return text
     except Exception as e:
         logger.warning(f"Web scrape failed for domain {domain}: {e}")
         return ""
 
-# ─── GPT fallback (with web context) ──────────────────────────────
-def call_gpt_fallback(row, web_context=""):
+def call_gpt_fallback(row, web_context="", filled=None):
     prompt = f"""
 You are an expert on venues and ticket sales.
-Fill in the following fields for "{row['name']}". Use as much context as possible.
+Fill in ONLY the fields that are missing below for "{row['name']}".
+Known fields: {filled if filled else {}}
 
-Venue known details:
+Venue details:
 - Name: {row['name']}
 - Alt name: {row.get('alt_name')}
 - Category: {row.get('category')}
@@ -192,25 +196,25 @@ Venue known details:
 - Domain: {row.get('domain')}
 - Linkedin: {row.get('linkedin_url')}
 - Phone: {row.get('phone_number') or ''}
-
 Additional website context (scraped text): {web_context[:1000]}
 
-Respond ONLY with a JSON object like:
+Respond ONLY with a JSON object. 
+If you do not know a value, set it to null. You may guess the ticket_vendor if you can infer from web or scraped content.
+Example:
 {{
-  "avg_ticket_price": [number in USD, or a reasonable guess],
-  "capacity": [integer, or a reasonable guess],
-  "ticket_vendor": [string, or "Unknown"],
-  "annual_revenue": [number, or a reasonable guess],
-  "ticketing_revenue": [number, or a reasonable guess]
+  "avg_ticket_price": [number or null],
+  "capacity": [integer or null],
+  "ticket_vendor": [string or null],
+  "annual_revenue": [number or null],
+  "ticketing_revenue": [number or null]
 }}
-Do NOT add extra text or explanation—ONLY the JSON.
 """
     try:
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "system", "content": prompt}],
             max_tokens=200,
-            temperature=0.1,
+            temperature=0.2,
         )
         raw = resp.choices[0].message['content']
         logger.info(f"GPT raw output for '{row['name']}': {raw}")
@@ -227,54 +231,64 @@ Do NOT add extra text or explanation—ONLY the JSON.
                     data = {}
             else:
                 data = {}
-        # Ensure all keys exist, with fallback guesses if not present
-        data.setdefault("avg_ticket_price", 30)
-        data.setdefault("capacity", 500)
-        data.setdefault("ticket_vendor", "Unknown")
-        data.setdefault("annual_revenue", 100000)
-        data.setdefault("ticketing_revenue", 40000)
-        return data
+        # Build sources dict:
+        sources = {}
+        for k in ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]:
+            if data.get(k) is not None:
+                sources[f"{k}_source"] = "GPT"
+        return data, sources
     except Exception as e:
         logger.warning(f"GPT fallback failed for {row.get('name')}: {e}")
         return {
-            "avg_ticket_price": 30,
-            "capacity": 500,
-            "ticket_vendor": "Unknown",
-            "annual_revenue": 100000,
-            "ticketing_revenue": 40000
-        }
+            "avg_ticket_price": None,
+            "capacity": None,
+            "ticket_vendor": None,
+            "annual_revenue": None,
+            "ticketing_revenue": None
+        }, {}
 
-# ─── Core enrichment ──────────────────────────────────────────────
 def enrich_row(row):
     enriched = {}
+    sources = {}
 
     # Google Places
-    enriched.update(get_google_places_info(row.get("name"), row.get("domain")))
+    result, source = get_google_places_info(row.get("name"), row.get("domain"))
+    enriched.update(result)
+    sources.update(source)
 
     # Ticketmaster
-    enriched.update(get_ticketmaster_info(row.get("name")))
+    result, source = get_ticketmaster_info(row.get("name"))
+    enriched.update({k: v for k, v in result.items() if v is not None})
+    sources.update(source)
 
     # Eventbrite
-    enriched.update(get_eventbrite_info(row.get("name")))
+    result, source = get_eventbrite_info(row.get("name"))
+    enriched.update({k: v for k, v in result.items() if v is not None and k not in enriched})
+    sources.update({k: v for k, v in source.items() if k not in sources})
 
     # Wikidata
-    enriched.update(get_wikidata_info(row.get("name")))
+    result, source = get_wikidata_info(row.get("name"))
+    enriched.update({k: v for k, v in result.items() if v is not None and k not in enriched})
+    sources.update({k: v for k, v in source.items() if k not in sources})
 
-    # Check for missing keys
+    # Now GPT for any missing fields (all fields allowed, but with source tracked)
     missing = [k for k in ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]
                if enriched.get(k) is None]
-    # Scrape context for GPT prompt
     web_context = scrape_venue_website(row.get("domain"))
     if missing:
-        gpt_result = call_gpt_fallback(row, web_context=web_context)
+        gpt_result, gpt_sources = call_gpt_fallback(row, web_context=web_context, filled=enriched)
         for k in missing:
             enriched[k] = gpt_result.get(k)
-    return enriched
+            if gpt_result.get(k) is not None:
+                sources[f"{k}_source"] = "GPT"
 
-# ─── Write enriched row ───────────────────────────────────────────
-def write_row(raw, enriched):
+    return enriched, sources
+
+def write_row(raw, enriched, sources):
     rec = raw.copy()
     rec.update(enriched)
+    for k, v in sources.items():
+        rec[k] = v
     rec["enrichment_status"] = "DONE"
     rec["last_updated"] = datetime.datetime.utcnow().isoformat()
     try:
@@ -284,7 +298,6 @@ def write_row(raw, enriched):
     except Exception as e:
         logger.error(f"BigQuery insert exception for '{raw.get('name')}': {e}")
 
-# ─── HTTP endpoint ────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
@@ -298,8 +311,8 @@ def run_batch():
     logger.info(f"Processing {len(rows)} rows")
     processed = 0
     for r in rows:
-        enriched = enrich_row(r)
-        write_row(r, enriched)
+        enriched, sources = enrich_row(r)
+        write_row(r, enriched, sources)
         processed += 1
     return jsonify(processed=processed, status="OK")
 

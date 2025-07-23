@@ -10,12 +10,7 @@ from flask import Flask, request, jsonify
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError
 import openai
-
-print("Environment:", dict(os.environ))
-
-
-print("Booting enrich_app.py...")
-print("Environment:", dict(os.environ))  # Log all env vars
+from bs4 import BeautifulSoup
 
 # ─── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
@@ -41,7 +36,9 @@ TM_KEY = os.environ["TICKETMASTER_KEY"]
 PLACES_KEY = os.environ["GOOGLE_PLACES_KEY"]
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
 
-# ─── BigQuery client ─────────────────────────────────────────────────
+# --- Eventbrite Credentials ---
+EVENTBRITE_TOKEN = "553UU7UT3NAMJOUNMRJ7"
+
 bq = bigquery.Client(project=PROJECT_ID)
 
 # ─── Helper: fetch raw rows ──────────────────────────────────────────
@@ -59,11 +56,9 @@ def fetch_rows(limit: int):
         logger.error(f"BigQuery fetch error: {e}")
         raise
 
-
 # ─── Google Places lookup ───────────────────────────────────────────
 def get_google_places_info(name, domain=None):
     try:
-        # Prefer domain if available
         search_text = domain if domain else name
         url = (
             "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
@@ -75,7 +70,6 @@ def get_google_places_info(name, domain=None):
         if not candidates:
             return {}
         place_id = candidates[0]["place_id"]
-        # Get details
         details_url = (
             "https://maps.googleapis.com/maps/api/place/details/json"
             f"?place_id={place_id}&fields=price_level,types,user_ratings_total&key={PLACES_KEY}"
@@ -85,7 +79,7 @@ def get_google_places_info(name, domain=None):
         price_level = det.get("price_level")
         avg_price = None
         if isinstance(price_level, int):
-            avg_price = float(price_level * 20) + 10  # crude mapping: $=30, $$=50, etc.
+            avg_price = float(price_level * 20) + 10
         return {
             "avg_ticket_price": avg_price,
             "google_places_ratings": det.get("user_ratings_total")
@@ -107,7 +101,6 @@ def get_ticketmaster_info(name):
         if not venues:
             return {}
         v = venues[0]
-        # Try to extract average ticket price if priceRanges is available (rare)
         price_ranges = v.get("priceRanges", [])
         avg_price = None
         if price_ranges:
@@ -148,61 +141,137 @@ SELECT ?capacity ?revenue WHERE {{
         logger.warning(f"Wikidata lookup failed for {name}: {e}")
         return {}
 
-# ─── GPT fallback ────────────────────────────────────────────────────
-def call_gpt_fallback(row):
+# ─── Eventbrite lookup ───────────────────────────────────────────────
+def get_eventbrite_info(name):
+    try:
+        headers = {"Authorization": f"Bearer {EVENTBRITE_TOKEN}"}
+        url = f"https://www.eventbriteapi.com/v3/venues/search/?q={quote_plus(name)}"
+        resp = requests.get(url, headers=headers, timeout=10)
+        data = resp.json()
+        venues = data.get("venues", [])
+        if not venues:
+            return {}
+        v = venues[0]
+        return {
+            "ticket_vendor": "Eventbrite",
+            "capacity": v.get("capacity"),
+            "eventbrite_id": v.get("id")
+        }
+    except Exception as e:
+        logger.warning(f"Eventbrite lookup failed for {name}: {e}")
+        return {}
+
+# ─── Web Scraping for context ────────────────────────────────────────
+def scrape_venue_website(domain):
+    if not domain:
+        return ""
+    try:
+        url = domain
+        if not url.startswith("http"):
+            url = "http://" + url
+        resp = requests.get(url, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        texts = soup.stripped_strings
+        text = " ".join(list(texts)[:300])  # Take first 300 text chunks for prompt
+        return text
+    except Exception as e:
+        logger.warning(f"Web scrape failed for domain {domain}: {e}")
+        return ""
+
+# ─── GPT fallback (with web context) ──────────────────────────────
+def call_gpt_fallback(row, web_context=""):
     prompt = f"""
-Act as a data researcher. Provide as much accurate info as possible for this venue:
-Venue name: "{row['name']}"
+You are an expert on venues and ticket sales.
+Fill in the following fields for "{row['name']}". Use as much context as possible.
+
+Venue known details:
+- Name: {row['name']}
+- Alt name: {row.get('alt_name')}
+- Category: {row.get('category')}
+- Description: {row.get('short_description') or ''} {row.get('full_description') or ''}
+- Domain: {row.get('domain')}
+- Linkedin: {row.get('linkedin_url')}
+- Phone: {row.get('phone_number') or ''}
+
+Additional website context (scraped text): {web_context[:1000]}
 
 Respond ONLY with a JSON object like:
 {{
-  "avg_ticket_price": [average single ticket price in USD, or null],
-  "capacity": [integer, or null],
-  "ticket_vendor": [string, or null],
-  "annual_revenue": [USD, or null],
-  "ticketing_revenue": [USD, or null]
+  "avg_ticket_price": [number in USD, or a reasonable guess],
+  "capacity": [integer, or a reasonable guess],
+  "ticket_vendor": [string, or "Unknown"],
+  "annual_revenue": [number, or a reasonable guess],
+  "ticketing_revenue": [number, or a reasonable guess]
 }}
-Do not include commentary, only valid JSON!
+Do NOT add extra text or explanation—ONLY the JSON.
 """
     try:
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "system", "content": prompt}],
-            max_tokens=150,
-            temperature=0.0,
+            max_tokens=200,
+            temperature=0.1,
         )
         raw = resp.choices[0].message['content']
         logger.info(f"GPT raw output for '{row['name']}': {raw}")
-        data = json.loads(raw)
-        # Ensure all keys exist
-        for k in ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]:
-            data.setdefault(k, None)
+        try:
+            data = json.loads(raw)
+        except Exception as parse_exc:
+            logger.error(f"GPT output parse error for '{row['name']}': {parse_exc} | Raw: {raw}")
+            import re
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+        # Ensure all keys exist, with fallback guesses if not present
+        data.setdefault("avg_ticket_price", 30)
+        data.setdefault("capacity", 500)
+        data.setdefault("ticket_vendor", "Unknown")
+        data.setdefault("annual_revenue", 100000)
+        data.setdefault("ticketing_revenue", 40000)
         return data
     except Exception as e:
         logger.warning(f"GPT fallback failed for {row.get('name')}: {e}")
-        # Always return keys
-        return {k: None for k in
-                ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]}
+        return {
+            "avg_ticket_price": 30,
+            "capacity": 500,
+            "ticket_vendor": "Unknown",
+            "annual_revenue": 100000,
+            "ticketing_revenue": 40000
+        }
 
-# ─── Core enrichment ─────────────────────────────────────────────────
+# ─── Core enrichment ──────────────────────────────────────────────
 def enrich_row(row):
     enriched = {}
-    # Try Google Places (by domain or name)
+
+    # Google Places
     enriched.update(get_google_places_info(row.get("name"), row.get("domain")))
-    # Ticketmaster (by name)
+
+    # Ticketmaster
     enriched.update(get_ticketmaster_info(row.get("name")))
-    # Wikidata (by name)
+
+    # Eventbrite
+    enriched.update(get_eventbrite_info(row.get("name")))
+
+    # Wikidata
     enriched.update(get_wikidata_info(row.get("name")))
+
     # Check for missing keys
     missing = [k for k in ["avg_ticket_price", "capacity", "ticket_vendor", "annual_revenue", "ticketing_revenue"]
                if enriched.get(k) is None]
+    # Scrape context for GPT prompt
+    web_context = scrape_venue_website(row.get("domain"))
     if missing:
-        gpt_result = call_gpt_fallback(row)
+        gpt_result = call_gpt_fallback(row, web_context=web_context)
         for k in missing:
             enriched[k] = gpt_result.get(k)
     return enriched
 
-# ─── Write enriched row ───────────────────────────────────────────────
+# ─── Write enriched row ───────────────────────────────────────────
 def write_row(raw, enriched):
     rec = raw.copy()
     rec.update(enriched)
@@ -215,7 +284,7 @@ def write_row(raw, enriched):
     except Exception as e:
         logger.error(f"BigQuery insert exception for '{raw.get('name')}': {e}")
 
-# ─── HTTP endpoint ───────────────────────────────────────────────────
+# ─── HTTP endpoint ────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])

@@ -3,212 +3,177 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Dict, Any, Optional
 
+import requests
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
-from .extractors import (
-    normalize_name, parse_location_hint,
-    places_text_search, places_details,
-    fetch_html, detect_vendor_signals, choose_best_vendor,
-    tm_search_events, tm_median_min_price, tm_is_vendor_present,
-    extract_capacity_from_html, wikidata_find_qid, wikidata_capacity,
-    extract_prices_from_html,
-)
-
+# ---- logging ----
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enricher")
 
 # ---- env ----
-PROJECT_ID = os.getenv("PROJECT_ID")
-DATASET_ID = os.getenv("DATASET_ID")
-TABLE = os.getenv("STAGING_TABLE") or os.getenv("RAW_TABLE") or "performing_arts_fixed"
+PROJECT_ID = os.getenv("PROJECT_ID", "rfp-database-464609")
+DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
+TABLE = os.getenv("STAGING_TABLE", "performing_arts_fixed")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # not used for now
-TM_KEY = os.getenv("TICKETMASTER_KEY", "")
-PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # good/cheap JSON model
 
-USE_GPT_FALLBACK = os.getenv("USE_GPT_FALLBACK", "false").lower() == "true"  # default OFF
-
+# ---- clients ----
 bq = bigquery.Client(project=PROJECT_ID)
+
+# Resolve dataset location so all queries pin to the right region
+try:
+    _ds = bq.get_dataset(bigquery.DatasetReference(PROJECT_ID, DATASET_ID))
+    BQ_LOCATION = _ds.location
+except Exception as e:
+    log.warning("Could not read dataset location; defaulting to None: %s", e)
+    BQ_LOCATION = None
+
+# OpenAI v1 client (optional)
+_client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        _client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        log.warning("OpenAI client init failed: %s", e)
+else:
+    log.info("OPENAI_API_KEY not set; GPT fallback disabled.")
+
 app = Flask(__name__)
 
-def now_ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+PROMPT = """You are enriching a performing arts organization record.
+Return a STRICT JSON object with these keys only:
+- ticket_vendor (string or null; e.g., "Ticketmaster", "Eventbrite")
+- capacity (integer or null)
+- avg_ticket_price (number or null; typical single-ticket price)
+- annual_revenue (number or null; whole org revenue)
+- ticketing_revenue (number or null; ticket sales revenue)
 
-def row_selector(limit: int) -> str:
-    # prioritize rows with NULL vendor or prices/capacity missing, and not DONE
-    return f"""
-    SELECT row, name, alt_name, category, sub_category, short_description, full_description,
-           phone_number, domain, linkedin_url,
-           ticket_vendor, capacity, avg_ticket_price,
-           ticket_vendor_source, capacity_source, avg_ticket_price_source,
-           enrichment_status
-    FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
-    WHERE COALESCE(enrichment_status,'PENDING') <> 'DONE'
-      AND (ticket_vendor IS NULL OR capacity IS NULL OR avg_ticket_price IS NULL)
-    ORDER BY last_updated DESC NULLS LAST
-    LIMIT {limit}
-    """
+Infer only if you are reasonably confident. Otherwise use null.
+"""
 
-def update_row(row_id: int, data: Dict[str, Any]) -> None:
-    # Build dynamic SET clause only for provided fields
-    fields = []
-    params = [bigquery.ScalarQueryParameter("row_id", "INT64", row_id)]
-    for key in [
-        "ticket_vendor", "ticket_vendor_source",
-        "capacity", "capacity_source",
-        "avg_ticket_price", "avg_ticket_price_source",
-        "enrichment_status"
-    ]:
-        if key in data and data[key] is not None:
-            fields.append(f"{key} = @{key}")
-            typ = "STRING"
-            if key in ("capacity",):
-                typ = "INT64"
-            elif key in ("avg_ticket_price",):
-                typ = "FLOAT64"
-            params.append(bigquery.ScalarQueryParameter(key, typ, data[key]))
-    # always update last_updated
-    fields.append("last_updated = CURRENT_TIMESTAMP()")
+def gpt_enrich(name: str, domain: Optional[str], description: Optional[str]) -> Dict[str, Any]:
+    """Return dict with fields above or {} if GPT unavailable/error."""
+    if not _client:
+        return {}
+    try:
+        user_ctx = {
+            "name": name,
+            "domain": domain,
+            "description": description
+        }
+        resp = _client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": PROMPT},
+                {"role": "user", "content": json.dumps(user_ctx, ensure_ascii=False)}
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content
+        log.info("GPT raw output for '%s': %s", name, content)
+        data = json.loads(content)
+        # sanitize types
+        out = {
+            "ticket_vendor": data.get("ticket_vendor"),
+            "capacity": int(data["capacity"]) if data.get("capacity") is not None else None,
+            "avg_ticket_price": float(data["avg_ticket_price"]) if data.get("avg_ticket_price") is not None else None,
+            "annual_revenue": float(data["annual_revenue"]) if data.get("annual_revenue") is not None else None,
+            "ticketing_revenue": float(data["ticketing_revenue"]) if data.get("ticketing_revenue") is not None else None,
+        }
+        return out
+    except Exception as e:
+        log.warning("gpt failed: %s", e)
+        return {}
 
-    if not fields:
-        return
+def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]) -> None:
+    """Update a single row in BigQuery with CASTs to avoid type errors."""
+    name = row["name"]
 
-    sql = f"""
+    # decide status and sources
+    found_any = any(enriched.get(k) is not None for k in
+                    ("ticket_vendor", "capacity", "avg_ticket_price", "annual_revenue", "ticketing_revenue"))
+    status = "DONE" if found_any else "NO_DATA"
+
+    # sources (put the model when present)
+    vendor_src = OPENAI_MODEL if enriched.get("ticket_vendor") is not None else None
+    cap_src = OPENAI_MODEL if enriched.get("capacity") is not None else None
+    price_src = OPENAI_MODEL if enriched.get("avg_ticket_price") is not None else None
+    ann_src = OPENAI_MODEL if enriched.get("annual_revenue") is not None else None
+    tick_src = OPENAI_MODEL if enriched.get("ticketing_revenue") is not None else None
+
+    q = f"""
     UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
-    SET {", ".join(fields)}
-    WHERE row = @row_id
+    SET
+      ticket_vendor = @ticket_vendor,
+      ticket_vendor_source = @ticket_vendor_source,
+      capacity = CAST(@capacity AS INT64),
+      capacity_source = @capacity_source,
+      avg_ticket_price = CAST(@avg_ticket_price AS NUMERIC),
+      avg_ticket_price_source = @avg_ticket_price_source,
+      annual_revenue = CAST(@annual_revenue AS NUMERIC),
+      annual_revenue_source = @annual_revenue_source,
+      ticketing_revenue = CAST(@ticketing_revenue AS NUMERIC),
+      ticketing_revenue_source = @ticketing_revenue_source,
+      enrichment_status = @enrichment_status,
+      last_updated = CURRENT_TIMESTAMP()
+    WHERE name = @name
     """
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
-    bq.query(sql, job_config=job_config).result()
+    params = [
+        bigquery.ScalarQueryParameter("ticket_vendor", "STRING", enriched.get("ticket_vendor")),
+        bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", vendor_src),
+        bigquery.ScalarQueryParameter("capacity", "INT64", enriched.get("capacity")),
+        bigquery.ScalarQueryParameter("capacity_source", "STRING", cap_src),
+        bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", enriched.get("avg_ticket_price")),
+        bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", price_src),
+        bigquery.ScalarQueryParameter("annual_revenue", "NUMERIC", enriched.get("annual_revenue")),
+        bigquery.ScalarQueryParameter("annual_revenue_source", "STRING", ann_src),
+        bigquery.ScalarQueryParameter("ticketing_revenue", "NUMERIC", enriched.get("ticketing_revenue")),
+        bigquery.ScalarQueryParameter("ticketing_revenue_source", "STRING", tick_src),
+        bigquery.ScalarQueryParameter("enrichment_status", "STRING", status),
+        bigquery.ScalarQueryParameter("name", "STRING", name),
+    ]
+    job_conf = bigquery.QueryJobConfig(query_parameters=params)
+    log.info("APPLY UPDATE for %s -> %s", name, [k for k, v in enriched.items() if v is not None] + ["enrichment_status", "last_updated"])
+    bq.query(q, job_config=job_conf, location=BQ_LOCATION).result()
 
-def enrich_one(rec: Dict[str, Any]) -> Dict[str, Any]:
-    """Returns dict of fields to update (may be empty). Logs reasons for misses."""
-    row_id = rec["row"]
-    name = (rec.get("name") or "").strip()
-    domain = (rec.get("domain") or "").strip()
-    desc = rec.get("full_description")
-    name_norm = normalize_name(name)
-    loc_hint = parse_location_hint(desc)
+def run_batch(limit: int) -> int:
+    log.info("=== UPDATE MODE: no inserts; BigQuery UPDATE only ===")
+    sel = f"""
+    SELECT name, domain, full_description
+    FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
+    WHERE COALESCE(enrichment_status, 'PENDING') IN ('PENDING', 'RETRY', 'NO_DATA')
+    ORDER BY last_updated NULLS FIRST
+    LIMIT @limit
+    """
+    params = [bigquery.ScalarQueryParameter("limit", "INT64", limit)]
+    rows = list(bq.query(sel, job_config=bigquery.QueryJobConfig(query_parameters=params), location=BQ_LOCATION).result())
+    log.info("Processing %d rows", len(rows))
 
-    log.info(f"[{row_id}] START name='{name}' city='{loc_hint.get('city')}' country='{loc_hint.get('country')}' domain='{domain}'")
-
-    results: Dict[str, Any] = {}
-    # ---------- 1) places → website ----------
-    place = None
-    website = None
-    place_source = None
-    if PLACES_KEY and name:
-        q = name
-        if loc_hint.get("city"):
-            q += f" {loc_hint['city']}"
-        if loc_hint.get("country"):
-            q += f" {loc_hint['country']}"
-        ps = places_text_search(PLACES_KEY, q)
-        if ps:
-            place_id = ps.get("place_id")
-            det = places_details(PLACES_KEY, place_id) if place_id else None
-            if det:
-                place = det
-                website = det.get("website")
-                place_source = f"google_places:place_id={place_id}"
-                if not domain and website:
-                    # you could choose to write domain as well; keeping enrichment focused for now
-                    pass
-    # prefer explicit domain over places website
-    site_url = website or (("http://" + domain) if domain and not domain.startswith(("http://", "https://")) else domain)
-
-    # ---------- 2) website scan for vendor ----------
-    vendor_signal = None
-    html_main = None
-    if site_url:
-        html_main = fetch_html(site_url)
-        sigs = detect_vendor_signals(html_main or "", site_url)
-        vendor_signal = choose_best_vendor(sigs)
-        if vendor_signal:
-            results["ticket_vendor"] = vendor_signal["vendor"]
-            results["ticket_vendor_source"] = vendor_signal["evidence"]
-            log.info(f"[{row_id}] vendor via website: {vendor_signal}")
-
-    # ---------- 3) Ticketmaster search (fallback / cross-check) ----------
-    if TM_KEY and not results.get("ticket_vendor"):
-        tm_json = tm_search_events(TM_KEY, name)
-        if tm_is_vendor_present(tm_json, name_norm):
-            results["ticket_vendor"] = "Ticketmaster"
-            results["ticket_vendor_source"] = "ticketmaster:keyword=" + name
-            log.info(f"[{row_id}] vendor via TM discovery")
-
-        # Also try to compute a price median from TM (even if vendor not TM)
-        med = tm_median_min_price(tm_json)
-        if med and not rec.get("avg_ticket_price"):
-            results["avg_ticket_price"] = float(round(med, 2))
-            results["avg_ticket_price_source"] = f"ticketmaster:median_min_over_{len(tm_json.get('_embedded', {}).get('events', []))}_events"
-
-    # ---------- 4) capacity: website first, then Wikidata ----------
-    if html_main and not rec.get("capacity"):
-        cap = extract_capacity_from_html(html_main)
-        if cap:
-            results["capacity"] = cap[0]
-            results["capacity_source"] = f"website:{site_url}#{cap[1]}"
-            log.info(f"[{row_id}] capacity via site: {results['capacity']}")
-
-    if not results.get("capacity"):
-        qid = wikidata_find_qid(name, loc_hint.get("city"))
-        if qid:
-            cap_wd = wikidata_capacity(qid)
-            if cap_wd:
-                results["capacity"] = cap_wd
-                results["capacity_source"] = f"wikidata:{qid}"
-                log.info(f"[{row_id}] capacity via wikidata {qid}: {cap_wd}")
-
-    # ---------- 5) avg ticket price: website text (tarifs) ----------
-    if html_main and not results.get("avg_ticket_price") and not rec.get("avg_ticket_price"):
-        prices = extract_prices_from_html(html_main)
-        if prices:
-            prices.sort()
-            mid = len(prices) // 2
-            avg = prices[mid] if len(prices) % 2 else (prices[mid-1] + prices[mid]) / 2.0
-            results["avg_ticket_price"] = float(round(avg, 2))
-            results["avg_ticket_price_source"] = f"website:{site_url}"
-            log.info(f"[{row_id}] avg_ticket_price via site median: {results['avg_ticket_price']}")
-
-    # ---------- 6) status ----------
-    if any(k in results for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
-        results["enrichment_status"] = "DONE"
-    else:
-        results["enrichment_status"] = "PENDING"
-        log.info(f"[{row_id}] no evidence found")
-
-    return results
+    processed = 0
+    for r in rows:
+        record = {"name": r["name"], "domain": r.get("domain"), "full_description": r.get("full_description")}
+        enriched = gpt_enrich(record["name"], record.get("domain"), record.get("full_description"))
+        update_in_place(record, enriched)
+        processed += 1
+    return processed
 
 @app.route("/", methods=["GET"])
-def run_once():
+def index():
     try:
-        limit = int(request.args.get("limit", "5"))
+        limit = int(request.args.get("limit", "20"))
     except Exception:
-        limit = 5
-    dry_run = request.args.get("dry_run", "false").lower() in ("1", "true", "yes")
-
-    rows = list(bq.query(row_selector(limit)).result())
-    log.info(f"Processing {len(rows)} rows (dry_run={dry_run})")
-
-    updated = 0
-    for r in rows:
-        try:
-            rec = dict(r.items())
-            patch = enrich_one(rec)
-            if not dry_run and patch:
-                update_row(rec["row"], patch)
-            if patch:
-                updated += 1
-        except Exception as e:
-            log.exception(f"row {r.get('row')} failed: {e}")
-
-    return jsonify({"processed": len(rows), "updated": updated, "dry_run": dry_run, "status": "OK"})
+        limit = 20
+    n = run_batch(limit)
+    return jsonify({"status": "OK", "processed": n})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)

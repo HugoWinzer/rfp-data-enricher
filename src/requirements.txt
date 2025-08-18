@@ -1,5 +1,7 @@
+cat > requirements.txt <<'REQ'
 google-cloud-bigquery<4.0.0
 openai<1.0.0
 flask<3.0.0
 requests
 beautifulsoup4
+REQ

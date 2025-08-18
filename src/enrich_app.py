@@ -1,3 +1,6 @@
+# --- src/enrich_app.py ---
+cat > src/enrich_app.py <<'PY'
+<PASTE START>
 import os, sys, json, datetime, logging
 from urllib.parse import quote_plus, urljoin
 from collections import defaultdict
@@ -13,7 +16,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enricher")
 
-# ---- env ----
 PROJECT_ID = os.getenv("PROJECT_ID", "rfp-database-464609")
 DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
 TABLE = os.getenv("STAGING_TABLE", os.getenv("RAW_TABLE", "performing_arts_fixed"))
@@ -22,8 +24,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 TM_KEY = os.getenv("TICKETMASTER_KEY", "")
 PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY", "")
-BING_KEY = os.getenv("BING_KEY", "")               # optional
-EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN", "")  # optional
+BING_KEY = os.getenv("BING_KEY", "")
+EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN", "")
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
 
 openai.api_key = OPENAI_API_KEY
@@ -41,21 +43,20 @@ VENDOR_PATTERNS = {
 }
 MIN_VENDOR_SCORE = 0.75
 
-# ---- helpers ----
 _COL_CACHE = {}
 def table_columns():
     key = f"{PROJECT_ID}.{DATASET_ID}.{TABLE}"
     if key not in _COL_CACHE:
         rows = bq.query(f"""
-            SELECT column_name FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+            SELECT column_name
+            FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
             WHERE table_name = '{TABLE.split('.')[-1]}'
         """).result()
         _COL_CACHE[key] = {r["column_name"] for r in rows}
     return _COL_CACHE[key]
 
 def filter_to_table(d: dict) -> dict:
-    allowed = table_columns()
-    return {k: v for k, v in d.items() if k in allowed}
+    return {k: v for k, v in d.items() if k in table_columns()}
 
 def safe_get(url, headers=None, timeout=15):
     try:
@@ -70,7 +71,6 @@ def normalize_url(domain: str | None):
     if not domain.startswith("http"): domain = "http://" + domain
     return domain
 
-# ---- fetch queue ----
 def fetch_rows(limit: int):
     sql = f"""
       SELECT *
@@ -80,14 +80,13 @@ def fetch_rows(limit: int):
     """
     return [dict(r) for r in bq.query(sql).result()]
 
-# ---- deterministic sources ----
 def google_places_avg_price(name, domain=None):
     if not PLACES_KEY: return {}, {}
     try:
         search = domain or name
         url = ("https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
                f"?input={quote_plus(search)}&inputtype=textquery&fields=place_id&key={PLACES_KEY}")
-        r = safe_get(url); 
+        r = safe_get(url)
         if not r or r.status_code != 200: return {}, {}
         cands = r.json().get("candidates", [])
         if not cands: return {}, {}
@@ -153,7 +152,6 @@ SELECT ?capacity ?revenue WHERE {{
         log.warning(f"wikidata failed: {e}")
         return {}, {}, []
 
-# ---- website parsing (strong vendor signal) ----
 def scrape_site(domain):
     url = normalize_url(domain)
     if not url: return "", []
@@ -178,15 +176,16 @@ def detect_vendor_from_links(links):
     if not scores: return None, 0.0, []
     v = max(scores, key=scores.get); return v, scores[v], hits[v]
 
-# ---- bing backstop (optional) ----
 def bing_search(query, count=5):
     if not BING_KEY: return []
     url = "https://api.bing.microsoft.com/v7.0/search"
-    r = safe_get(url+f"?q={quote_plus(query)}&count={count}", headers={"Ocp-Apim-Subscription-Key":BING_KEY})
+    r = safe_get(url+f"?q={quote_plus(query)}&count={count}",
+                 headers={"Ocp-Apim-Subscription-Key":BING_KEY})
     if not r or r.status_code!=200: return []
     return [{"url": v.get("url")} for v in r.json().get("webPages", {}).get("value", [])]
 
 def detect_vendor_with_bing(name):
+    if not BING_KEY: return None, 0.0, []
     scores = defaultdict(float); hits = defaultdict(list)
     for vendor, patterns in VENDOR_PATTERNS.items():
         q = f'{name} site:{patterns[0].rstrip(".")}'
@@ -195,7 +194,6 @@ def detect_vendor_with_bing(name):
     if not scores: return None, 0.0, []
     v = max(scores, key=scores.get); return v, scores[v], hits[v]
 
-# ---- GPT fallback (strict, evidence-based) ----
 def gpt_extract(row, web_text, evidence_urls):
     if not OPENAI_API_KEY: return {}, {}
     prompt = f"""
@@ -222,7 +220,6 @@ Evidence: {json.dumps(evidence_urls[:10])}
         log.warning(f"gpt failed: {e}")
         return {}, {}
 
-# ---- orchestrate ----
 def enrich_row(row):
     enriched, sources = {}, {}
     evidence = []
@@ -263,13 +260,13 @@ def enrich_row(row):
 
     return enriched, sources
 
-# ---- update (entity_id) ----
 def update_in_place(row_dict, enriched, sources):
     payload = {**enriched, **sources,
                "enrichment_status":"DONE",
                "last_updated": datetime.datetime.utcnow()}
     payload = filter_to_table(payload)
     if not payload: return
+
     sets, params = [], []
     i = 0
     for k,v in payload.items():
@@ -281,19 +278,17 @@ def update_in_place(row_dict, enriched, sources):
         sets.append(f"{k}=@p{i}")
         params.append(bigquery.ScalarQueryParameter(f"p{i}", kind, v))
 
-    # prefer entity_id, fallback to name+domain (may update multiple if duplicates)
-    where = ""
     if row_dict.get("entity_id"):
-        where = "entity_id=@row_id"; params.append(bigquery.ScalarQueryParameter("row_id","STRING",row_dict["entity_id"]))
+        where = "entity_id=@row_id"
+        params.append(bigquery.ScalarQueryParameter("row_id","STRING",row_dict["entity_id"]))
     else:
         where = "LOWER(name)=@nm AND LOWER(IFNULL(domain,''))=@dm"
-        params.append(bigquery.ScalarQueryParameter("nm","STRING", (row_dict.get("name") or "").lower()))
-        params.append(bigquery.ScalarQueryParameter("dm","STRING", (row_dict.get("domain") or "").lower()))
+        params.append(bigquery.ScalarQueryParameter("nm","STRING",(row_dict.get("name") or "").lower()))
+        params.append(bigquery.ScalarQueryParameter("dm","STRING",(row_dict.get("domain") or "").lower()))
 
     q = f"UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE}` SET {', '.join(sets)} WHERE {where}"
     bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
 
-# ---- flask ----
 app = Flask(__name__)
 
 @app.get("/health")
@@ -317,3 +312,26 @@ def run_batch():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+<PASTE END>
+PY
+
+# --- requirements.txt ---
+cat > requirements.txt <<'REQ'
+google-cloud-bigquery<4.0.0
+openai<1.0.0
+flask<3.0.0
+requests
+beautifulsoup4
+REQ
+
+# --- Dockerfile ---
+cat > Dockerfile <<'DOCK'
+FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PORT=8080
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY src/ ./src/
+EXPOSE 8080
+CMD ["python", "src/enrich_app.py"]
+DOCK

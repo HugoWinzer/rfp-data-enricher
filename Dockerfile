@@ -1,10 +1,21 @@
+# ---- Dockerfile ----
 FROM python:3.11-slim
-WORKDIR /app
-COPY src/requirements.txt .
-RUN pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
-COPY src/enrich_app.py .
-ENV PORT 8080 PYTHONUNBUFFERED=1
-EXPOSE 8080
-CMD ["python","enrich_app.py"]
 
+# Prevent python from buffering stdout/stderr
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PORT=8080
+
+WORKDIR /app
+
+# Install deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy app code (note: your code is under src/)
+COPY src/ ./src/
+
+# Flask will bind to 0.0.0.0:8080 (the app uses PORT env var)
+EXPOSE 8080
+
+CMD ["python", "src/enrich_app.py"]

@@ -1,3 +1,4 @@
+cat > cloudbuild.yaml <<'YAML'
 options:
   logging: CLOUD_LOGGING_ONLY
 
@@ -13,7 +14,7 @@ steps:
 - name: gcr.io/cloud-builders/docker
   args: ['push', 'gcr.io/$PROJECT_ID/data-enricher:$SHORT_SHA']
 
-# Deploy to Cloud Run; inject secrets at runtime
+# Deploy to Cloud Run, wiring secrets at runtime
 - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
   entrypoint: gcloud
   args:
@@ -31,3 +32,4 @@ steps:
 
 images:
 - gcr.io/$PROJECT_ID/data-enricher:$SHORT_SHA
+YAML

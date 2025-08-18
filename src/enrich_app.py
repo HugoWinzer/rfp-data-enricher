@@ -1,6 +1,3 @@
-# src/enrich_app.py
-mkdir -p src
-cat > src/enrich_app.py <<'PY'
 import os, sys, json, datetime, logging
 from urllib.parse import quote_plus, urljoin
 from collections import defaultdict
@@ -56,7 +53,7 @@ def table_columns():
 def filter_to_table(d: dict) -> dict:
     return {k: v for k, v in d.items() if k in table_columns()}
 
-# ---- utils ----
+# ---- http utils ----
 def safe_get(url, headers=None, timeout=15):
     try:
         return requests.get(url, headers=headers, timeout=timeout)
@@ -97,7 +94,7 @@ def google_places_avg_price(name, domain=None):
         if not det or det.status_code != 200: return {}, {}
         pl = det.json().get("result", {}).get("price_level")
         if isinstance(pl, int):
-            # rough anchor; we keep it conservative and label the source
+            # very rough anchor; labeled as google_places
             return {"avg_ticket_price": float(pl*20 + 10)}, {"avg_ticket_price_source":"google_places"}
         return {}, {}
     except Exception as e:
@@ -129,7 +126,7 @@ def scrape_site(domain):
     for a in soup.find_all("a", href=True):
         links.append(urljoin(url, a["href"]))
     for tag in soup.find_all(["script","link"], src=True):
-        links.append(urljoin(url, tag["src"]))
+        links.append(urljoin(url, tag.get("src") or ""))
     return text, links
 
 def detect_vendor_from_links(links):
@@ -196,3 +193,68 @@ def enrich_row(row):
     if missing:
         gpt_out, gpt_src = gpt_extract(row, web_text, evidence)
         for k in missing:
+            if gpt_out.get(k) is not None:
+                enriched[k]=gpt_out[k]; sources[f"{k}_source"]="gpt"
+
+    return enriched, sources
+
+# ---- update (no inserts, only UPDATE) ----
+def update_in_place(row_dict, enriched, sources):
+    payload = {**enriched, **sources,
+               "enrichment_status":"DONE",
+               "last_updated": datetime.datetime.utcnow()}
+    payload = filter_to_table(payload)
+    if not payload:
+        log.info(f"SKIP update (nothing to set) for {row_dict.get('name')}")
+        return
+
+    sets, params = [], []
+    i = 0
+    for k,v in payload.items():
+        i += 1
+        kind = "STRING"
+        if isinstance(v,int): kind="INT64"
+        elif isinstance(v,float): kind="FLOAT64"
+        elif isinstance(v,datetime.datetime): kind="TIMESTAMP"
+        sets.append(f"{k}=@p{i}")
+        params.append(bigquery.ScalarQueryParameter(f"p{i}", kind, v))
+
+    # Prefer entity_id if present; fallback to name+domain
+    if row_dict.get("entity_id"):
+        where = "entity_id=@row_id"
+        params.append(bigquery.ScalarQueryParameter("row_id","STRING", row_dict["entity_id"]))
+    else:
+        where = "LOWER(name)=@nm AND LOWER(IFNULL(domain,''))=@dm"
+        params.append(bigquery.ScalarQueryParameter("nm","STRING",(row_dict.get("name") or "").lower()))
+        params.append(bigquery.ScalarQueryParameter("dm","STRING",(row_dict.get("domain") or "").lower()))
+
+    q = f"UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE}` SET {', '.join(sets)} WHERE {where}"
+    log.info(f"APPLY UPDATE for {row_dict.get('name')} -> {list(payload.keys())}")
+    bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+
+# ---- flask ----
+app = Flask(__name__)
+
+@app.get("/health")
+def health():
+    return {"ok": True, "mode": "UPDATE_ONLY"}
+
+@app.get("/")
+def run_batch():
+    limit = int(request.args.get("limit","10"))
+    rows = fetch_rows(limit)
+    log.info("=== UPDATE MODE: no inserts; BigQuery UPDATE only ===")
+    log.info(f"Processing {len(rows)} rows")
+    processed = 0
+    for r in rows:
+        try:
+            enriched, sources = enrich_row(r)
+            update_in_place(r, enriched, sources)
+            processed += 1
+        except Exception as e:
+            log.exception(f"Failed row: {r.get('name')}: {e}")
+    return jsonify(processed=processed, status="OK")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

@@ -83,4 +83,179 @@ def absolute_link(href: str, base: str) -> str:
         return href
 
 def detect_vendor_signals(html: str, base_url: str) -> List[Dict[str, str]]:
-    """Return a list of vendor sig
+    """Return a list of vendor signal dicts: {'vendor':..., 'evidence':..., 'type': 'link|script'}"""
+    signals: List[Dict[str, str]] = []
+    if not html:
+        return signals
+    soup = BeautifulSoup(html, "html.parser")
+
+    # scripts
+    for s in soup.find_all("script", src=True):
+        src = s.get("src", "")
+        for sig in VENDOR_SIGNATURES:
+            if any(x in src for x in sig.script_substrings):
+                signals.append({"vendor": sig.name, "evidence": absolute_link(src, base_url), "type": "script"})
+
+    # anchors
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = (a.get_text() or "").lower().strip()
+        href_l = href.lower()
+        for sig in VENDOR_SIGNATURES:
+            if any(d in href_l for d in sig.domains) or any(k in text for k in sig.link_keywords):
+                signals.append({"vendor": sig.name, "evidence": absolute_link(href, base_url), "type": "link"})
+
+    # filter dupes
+    seen = set()
+    uniq = []
+    for s in signals:
+        key = (s["vendor"], s["evidence"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(s)
+    return uniq
+
+def choose_best_vendor(signals: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    if not signals:
+        return None
+    # prefer signals that look like purchase links
+    purchase_keywords = ("ticket", "billet", "billetterie", "acheter", "buy", "book")
+    def score(sig: Dict[str, str]) -> int:
+        base = VENDOR_PRIORITY.get(sig["vendor"], 1)
+        ev = sig.get("evidence", "").lower()
+        if sig["type"] == "link" and any(k in ev for k in purchase_keywords):
+            base += 5
+        return base
+    signals_sorted = sorted(signals, key=score, reverse=True)
+    return signals_sorted[0]
+
+# ----------------- Ticketmaster Discovery -----------------
+def tm_search_events(api_key: str, keyword: str) -> Dict[str, Any]:
+    # Country-specific search often helps, but keep it generic to start
+    url = "https://app.ticketmaster.com/discovery/v2/events.json"
+    params = {"apikey": api_key, "keyword": keyword, "size": 50, "sort": "date,asc"}
+    r = requests.get(url, params=params, headers=HDRS, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+def tm_median_min_price(tm_json: Dict[str, Any]) -> Optional[float]:
+    if not tm_json or "_embedded" not in tm_json:
+        return None
+    events = tm_json["_embedded"].get("events", [])
+    prices = []
+    for ev in events:
+        for pr in ev.get("priceRanges", []):
+            try:
+                mn = float(pr.get("min"))
+                if mn > 0:
+                    prices.append(mn)
+            except Exception:
+                continue
+    if not prices:
+        return None
+    prices.sort()
+    n = len(prices)
+    mid = n // 2
+    return float((prices[mid] if n % 2 == 1 else (prices[mid - 1] + prices[mid]) / 2.0))
+
+def tm_is_vendor_present(tm_json: Dict[str, Any], venue_name_norm: str) -> bool:
+    if not tm_json or "_embedded" not in tm_json:
+        return False
+    events = tm_json["_embedded"].get("events", [])
+    for ev in events:
+        # simple text heuristic: does event title/venue include venue name?
+        title = ev.get("name", "")
+        ven_name = ""
+        try:
+            ven = ev["_embedded"]["venues"][0]
+            ven_name = ven.get("name", "")
+        except Exception:
+            pass
+        blob = f"{title} {ven_name}".lower()
+        if any(tok in blob for tok in venue_name_norm.split()):
+            return True
+    return False
+
+# ----------------- Capacity extraction -----------------
+CAPACITY_PATTERNS = [
+    r"\b(capacit[eé]|jauge|places?|seats?)\D{0,30}(\d{2,5})\b",
+    r"\b(\d{2,5})\s+(places?|seats?)\b",
+]
+def extract_capacity_from_html(html: str) -> Optional[Tuple[int, str]]:
+    if not html:
+        return None
+    text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
+    text = unidecode(text.lower())
+    for pat in CAPACITY_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            # pick the numeric group
+            nums = [g for g in m.groups() if g and g.isdigit()]
+            if nums:
+                val = int(nums[0])
+                if 20 <= val <= 100_000:
+                    return val, "page_text"
+    return None
+
+# ----------------- Wikidata capacity (P1083) -----------------
+def wikidata_find_qid(name: str, city: Optional[str]) -> Optional[str]:
+    # quicksearch API
+    q = name
+    if city:
+        q = f"{name} {city}"
+    url = "https://www.wikidata.org/w/api.php"
+    params = {"action": "wbsearchentities", "search": q, "language": "en", "format": "json"}
+    try:
+        r = requests.get(url, params=params, headers=HDRS, timeout=REQ_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        for hit in data.get("search", []):
+            if hit.get("id", "").startswith("Q"):
+                return hit["id"]
+    except requests.RequestException:
+        return None
+    return None
+
+def wikidata_capacity(qid: str) -> Optional[int]:
+    url = f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json"
+    try:
+        r = requests.get(url, headers=HDRS, timeout=REQ_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        ent = data.get("entities", {}).get(qid, {})
+        claims = ent.get("claims", {})
+        p1083 = claims.get("P1083", [])
+        for c in p1083:
+            mainsnak = c.get("mainsnak", {})
+            dv = mainsnak.get("datavalue", {})
+            val = dv.get("value")
+            if isinstance(val, dict) and "amount" in val:
+                try:
+                    num = int(float(val["amount"]))
+                    if 20 <= num <= 100_000:
+                        return num
+                except Exception:
+                    continue
+    except requests.RequestException:
+        return None
+    return None
+
+# ----------------- Price extraction from HTML -----------------
+def extract_prices_from_html(html: str) -> List[float]:
+    if not html:
+        return []
+    text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
+    text = unidecode(text.lower())
+    # common currency formats: €12, 12€, 12.50 eur, etc.
+    prices = []
+    for m in re.finditer(r"(?:(?:eur|euro|euros|€)\s*|\s*)(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:eur|euro|euros|€)?", text):
+        try:
+            num = float(m.group(1).replace(",", "."))
+            if 3 <= num <= 800:
+                prices.append(num)
+        except Exception:
+            continue
+    return prices

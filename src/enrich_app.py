@@ -1,260 +1,214 @@
-import os, sys, json, datetime, logging
-from urllib.parse import quote_plus, urljoin
-from collections import defaultdict
+# src/enrich_app.py
+import os
+import sys
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
-import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
-import openai
+
+from .extractors import (
+    normalize_name, parse_location_hint,
+    places_text_search, places_details,
+    fetch_html, detect_vendor_signals, choose_best_vendor,
+    tm_search_events, tm_median_min_price, tm_is_vendor_present,
+    extract_capacity_from_html, wikidata_find_qid, wikidata_capacity,
+    extract_prices_from_html,
+)
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enricher")
 
 # ---- env ----
-PROJECT_ID = os.getenv("PROJECT_ID", "rfp-database-464609")
-DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
-TABLE = os.getenv("STAGING_TABLE", os.getenv("RAW_TABLE", "performing_arts_fixed"))
+PROJECT_ID = os.getenv("PROJECT_ID")
+DATASET_ID = os.getenv("DATASET_ID")
+TABLE = os.getenv("STAGING_TABLE") or os.getenv("RAW_TABLE") or "performing_arts_fixed"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # not used for now
 TM_KEY = os.getenv("TICKETMASTER_KEY", "")
 PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY", "")
 
-openai.api_key = OPENAI_API_KEY
+USE_GPT_FALLBACK = os.getenv("USE_GPT_FALLBACK", "false").lower() == "true"  # default OFF
+
 bq = bigquery.Client(project=PROJECT_ID)
-
-VENDOR_PATTERNS = {
-    "Ticketmaster": ["ticketmaster.", "ticketmaster.fr", "ticketmaster.com"],
-    "Eventbrite": ["eventbrite.", "universe.com"],
-    "SeeTickets": ["seetickets.", "see-tickets."],
-    "DICE": ["dice.fm"],
-    "Shotgun": ["shotgun.live"],
-    "Weezevent": ["weezevent."],
-    "Billetweb": ["billetweb.fr"],
-    "HelloAsso": ["helloasso."]
-}
-MIN_VENDOR_SCORE = 0.75
-
-# ---- schema helpers ----
-_COL_CACHE = {}
-def table_columns():
-    key = f"{PROJECT_ID}.{DATASET_ID}.{TABLE}"
-    if key not in _COL_CACHE:
-        rows = bq.query(f"""
-            SELECT column_name
-            FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
-            WHERE table_name = '{TABLE.split('.')[-1]}'
-        """).result()
-        _COL_CACHE[key] = {r["column_name"] for r in rows}
-    return _COL_CACHE[key]
-
-def filter_to_table(d: dict) -> dict:
-    return {k: v for k, v in d.items() if k in table_columns()}
-
-# ---- http utils ----
-def safe_get(url, headers=None, timeout=15):
-    try:
-        return requests.get(url, headers=headers, timeout=timeout)
-    except Exception:
-        return None
-
-def normalize_url(domain: str | None):
-    if not domain: return None
-    domain = domain.strip()
-    if not domain: return None
-    if not domain.startswith("http"): domain = "http://" + domain
-    return domain
-
-# ---- queue ----
-def fetch_rows(limit: int):
-    sql = f"""
-      SELECT *
-      FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
-      WHERE (enrichment_status IS NULL OR enrichment_status='PENDING')
-      LIMIT {limit}
-    """
-    return [dict(r) for r in bq.query(sql).result()]
-
-# ---- deterministic sources ----
-def google_places_avg_price(name, domain=None):
-    if not PLACES_KEY: return {}, {}
-    try:
-        search = domain or name
-        url = ("https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
-               f"?input={quote_plus(search)}&inputtype=textquery&fields=place_id&key={PLACES_KEY}")
-        r = safe_get(url)
-        if not r or r.status_code != 200: return {}, {}
-        cands = r.json().get("candidates", [])
-        if not cands: return {}, {}
-        pid = cands[0]["place_id"]
-        det = safe_get("https://maps.googleapis.com/maps/api/place/details/json"
-                       f"?place_id={pid}&fields=price_level&key={PLACES_KEY}")
-        if not det or det.status_code != 200: return {}, {}
-        pl = det.json().get("result", {}).get("price_level")
-        if isinstance(pl, int):
-            # very rough anchor; labeled as google_places
-            return {"avg_ticket_price": float(pl*20 + 10)}, {"avg_ticket_price_source":"google_places"}
-        return {}, {}
-    except Exception as e:
-        log.warning(f"google places failed: {e}")
-        return {}, {}
-
-def ticketmaster_lookup(name):
-    if not TM_KEY: return {}, {}, []
-    url = f"https://app.ticketmaster.com/discovery/v2/venues.json?keyword={quote_plus(name)}&apikey={TM_KEY}"
-    r = safe_get(url)
-    if not r or r.status_code != 200: return {}, {}, []
-    venues = r.json().get("_embedded", {}).get("venues", [])
-    if not venues: return {}, {}, []
-    v = venues[0]; out, src, ev = {}, {}, []
-    if v.get("capacity"):
-        out["capacity"] = v["capacity"]; src["capacity_source"] = "ticketmaster_api"
-    out["ticket_vendor"] = "Ticketmaster"; src["ticket_vendor_source"] = "ticketmaster_api"
-    if v.get("url"): ev.append(v["url"])
-    return out, src, ev
-
-def scrape_site(domain):
-    url = normalize_url(domain)
-    if not url: return "", []
-    r = safe_get(url, timeout=20)
-    if not r or r.status_code >= 500: return "", []
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = " ".join(list(soup.stripped_strings)[:1200])
-    links = []
-    for a in soup.find_all("a", href=True):
-        links.append(urljoin(url, a["href"]))
-    for tag in soup.find_all(["script","link"], src=True):
-        links.append(urljoin(url, tag.get("src") or ""))
-    return text, links
-
-def detect_vendor_from_links(links):
-    scores = defaultdict(float); hits = defaultdict(list)
-    for link in links:
-        L = link.lower()
-        for vendor, patterns in VENDOR_PATTERNS.items():
-            if any(p in L for p in patterns):
-                scores[vendor]+=0.9; hits[vendor].append(link)
-    if not scores: return None, 0.0, []
-    v = max(scores, key=scores.get); return v, scores[v], hits[v]
-
-# ---- GPT fallback (only if needed) ----
-def gpt_extract(row, web_text, evidence_urls):
-    if not OPENAI_API_KEY: return {}, {}
-    prompt = f"""
-Use ONLY the provided website text/evidence. If unsure, return null.
-Return JSON with exactly these keys:
-{{"avg_ticket_price": number|null, "capacity": integer|null, "ticket_vendor": string|null,
-  "annual_revenue": number|null, "ticketing_revenue": number|null}}
-Venue: {row.get('name')}
-Domain: {row.get('domain')}
-TEXT:
-{web_text[:3500]}
-Evidence: {json.dumps(evidence_urls[:10])}
-"""
-    try:
-        resp = openai.ChatCompletion.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":prompt}],
-            temperature=0, max_tokens=220,
-        )
-        data = json.loads(resp.choices[0].message["content"])
-        src = {f"{k}_source":"gpt" for k,v in data.items() if v is not None}
-        return data, src
-    except Exception as e:
-        log.warning(f"gpt failed: {e}")
-        return {}, {}
-
-# ---- enrich ----
-def enrich_row(row):
-    enriched, sources = {}, {}
-    evidence = []
-
-    web_text, links = scrape_site(row.get("domain"))
-    v_site, score_site, site_hits = detect_vendor_from_links(links)
-    evidence += site_hits
-
-    tm_out, tm_src, tm_ev = ticketmaster_lookup(row.get("name"))
-    gp_out, gp_src = google_places_avg_price(row.get("name"), row.get("domain"))
-
-    for D,S in [(tm_out,tm_src),(gp_out,gp_src)]:
-        for k,v in D.items():
-            if v is not None and k not in enriched: enriched[k]=v
-        for k,v in S.items():
-            if k not in sources: sources[k]=v
-
-    if v_site and score_site >= MIN_VENDOR_SCORE:
-        enriched["ticket_vendor"] = v_site
-        sources["ticket_vendor_source"] = "website_links"
-
-    missing = [k for k in ["avg_ticket_price","capacity","ticket_vendor","annual_revenue","ticketing_revenue"]
-               if not enriched.get(k)]
-    if missing:
-        gpt_out, gpt_src = gpt_extract(row, web_text, evidence)
-        for k in missing:
-            if gpt_out.get(k) is not None:
-                enriched[k]=gpt_out[k]; sources[f"{k}_source"]="gpt"
-
-    return enriched, sources
-
-# ---- update (no inserts, only UPDATE) ----
-def update_in_place(row_dict, enriched, sources):
-    payload = {**enriched, **sources,
-               "enrichment_status":"DONE",
-               "last_updated": datetime.datetime.utcnow()}
-    payload = filter_to_table(payload)
-    if not payload:
-        log.info(f"SKIP update (nothing to set) for {row_dict.get('name')}")
-        return
-
-    sets, params = [], []
-    i = 0
-    for k,v in payload.items():
-        i += 1
-        kind = "STRING"
-        if isinstance(v,int): kind="INT64"
-        elif isinstance(v,float): kind="FLOAT64"
-        elif isinstance(v,datetime.datetime): kind="TIMESTAMP"
-        sets.append(f"{k}=@p{i}")
-        params.append(bigquery.ScalarQueryParameter(f"p{i}", kind, v))
-
-    # Prefer entity_id if present; fallback to name+domain
-    if row_dict.get("entity_id"):
-        where = "entity_id=@row_id"
-        params.append(bigquery.ScalarQueryParameter("row_id","STRING", row_dict["entity_id"]))
-    else:
-        where = "LOWER(name)=@nm AND LOWER(IFNULL(domain,''))=@dm"
-        params.append(bigquery.ScalarQueryParameter("nm","STRING",(row_dict.get("name") or "").lower()))
-        params.append(bigquery.ScalarQueryParameter("dm","STRING",(row_dict.get("domain") or "").lower()))
-
-    q = f"UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE}` SET {', '.join(sets)} WHERE {where}"
-    log.info(f"APPLY UPDATE for {row_dict.get('name')} -> {list(payload.keys())}")
-    bq.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
-
-# ---- flask ----
 app = Flask(__name__)
 
-@app.get("/health")
-def health():
-    return {"ok": True, "mode": "UPDATE_ONLY"}
+def now_ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-@app.get("/")
-def run_batch():
-    limit = int(request.args.get("limit","10"))
-    rows = fetch_rows(limit)
-    log.info("=== UPDATE MODE: no inserts; BigQuery UPDATE only ===")
-    log.info(f"Processing {len(rows)} rows")
-    processed = 0
+def row_selector(limit: int) -> str:
+    # prioritize rows with NULL vendor or prices/capacity missing, and not DONE
+    return f"""
+    SELECT row, name, alt_name, category, sub_category, short_description, full_description,
+           phone_number, domain, linkedin_url,
+           ticket_vendor, capacity, avg_ticket_price,
+           ticket_vendor_source, capacity_source, avg_ticket_price_source,
+           enrichment_status
+    FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
+    WHERE COALESCE(enrichment_status,'PENDING') <> 'DONE'
+      AND (ticket_vendor IS NULL OR capacity IS NULL OR avg_ticket_price IS NULL)
+    ORDER BY last_updated DESC NULLS LAST
+    LIMIT {limit}
+    """
+
+def update_row(row_id: int, data: Dict[str, Any]) -> None:
+    # Build dynamic SET clause only for provided fields
+    fields = []
+    params = [bigquery.ScalarQueryParameter("row_id", "INT64", row_id)]
+    for key in [
+        "ticket_vendor", "ticket_vendor_source",
+        "capacity", "capacity_source",
+        "avg_ticket_price", "avg_ticket_price_source",
+        "enrichment_status"
+    ]:
+        if key in data and data[key] is not None:
+            fields.append(f"{key} = @{key}")
+            typ = "STRING"
+            if key in ("capacity",):
+                typ = "INT64"
+            elif key in ("avg_ticket_price",):
+                typ = "FLOAT64"
+            params.append(bigquery.ScalarQueryParameter(key, typ, data[key]))
+    # always update last_updated
+    fields.append("last_updated = CURRENT_TIMESTAMP()")
+
+    if not fields:
+        return
+
+    sql = f"""
+    UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
+    SET {", ".join(fields)}
+    WHERE row = @row_id
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    bq.query(sql, job_config=job_config).result()
+
+def enrich_one(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Returns dict of fields to update (may be empty). Logs reasons for misses."""
+    row_id = rec["row"]
+    name = (rec.get("name") or "").strip()
+    domain = (rec.get("domain") or "").strip()
+    desc = rec.get("full_description")
+    name_norm = normalize_name(name)
+    loc_hint = parse_location_hint(desc)
+
+    log.info(f"[{row_id}] START name='{name}' city='{loc_hint.get('city')}' country='{loc_hint.get('country')}' domain='{domain}'")
+
+    results: Dict[str, Any] = {}
+    # ---------- 1) places → website ----------
+    place = None
+    website = None
+    place_source = None
+    if PLACES_KEY and name:
+        q = name
+        if loc_hint.get("city"):
+            q += f" {loc_hint['city']}"
+        if loc_hint.get("country"):
+            q += f" {loc_hint['country']}"
+        ps = places_text_search(PLACES_KEY, q)
+        if ps:
+            place_id = ps.get("place_id")
+            det = places_details(PLACES_KEY, place_id) if place_id else None
+            if det:
+                place = det
+                website = det.get("website")
+                place_source = f"google_places:place_id={place_id}"
+                if not domain and website:
+                    # you could choose to write domain as well; keeping enrichment focused for now
+                    pass
+    # prefer explicit domain over places website
+    site_url = website or (("http://" + domain) if domain and not domain.startswith(("http://", "https://")) else domain)
+
+    # ---------- 2) website scan for vendor ----------
+    vendor_signal = None
+    html_main = None
+    if site_url:
+        html_main = fetch_html(site_url)
+        sigs = detect_vendor_signals(html_main or "", site_url)
+        vendor_signal = choose_best_vendor(sigs)
+        if vendor_signal:
+            results["ticket_vendor"] = vendor_signal["vendor"]
+            results["ticket_vendor_source"] = vendor_signal["evidence"]
+            log.info(f"[{row_id}] vendor via website: {vendor_signal}")
+
+    # ---------- 3) Ticketmaster search (fallback / cross-check) ----------
+    if TM_KEY and not results.get("ticket_vendor"):
+        tm_json = tm_search_events(TM_KEY, name)
+        if tm_is_vendor_present(tm_json, name_norm):
+            results["ticket_vendor"] = "Ticketmaster"
+            results["ticket_vendor_source"] = "ticketmaster:keyword=" + name
+            log.info(f"[{row_id}] vendor via TM discovery")
+
+        # Also try to compute a price median from TM (even if vendor not TM)
+        med = tm_median_min_price(tm_json)
+        if med and not rec.get("avg_ticket_price"):
+            results["avg_ticket_price"] = float(round(med, 2))
+            results["avg_ticket_price_source"] = f"ticketmaster:median_min_over_{len(tm_json.get('_embedded', {}).get('events', []))}_events"
+
+    # ---------- 4) capacity: website first, then Wikidata ----------
+    if html_main and not rec.get("capacity"):
+        cap = extract_capacity_from_html(html_main)
+        if cap:
+            results["capacity"] = cap[0]
+            results["capacity_source"] = f"website:{site_url}#{cap[1]}"
+            log.info(f"[{row_id}] capacity via site: {results['capacity']}")
+
+    if not results.get("capacity"):
+        qid = wikidata_find_qid(name, loc_hint.get("city"))
+        if qid:
+            cap_wd = wikidata_capacity(qid)
+            if cap_wd:
+                results["capacity"] = cap_wd
+                results["capacity_source"] = f"wikidata:{qid}"
+                log.info(f"[{row_id}] capacity via wikidata {qid}: {cap_wd}")
+
+    # ---------- 5) avg ticket price: website text (tarifs) ----------
+    if html_main and not results.get("avg_ticket_price") and not rec.get("avg_ticket_price"):
+        prices = extract_prices_from_html(html_main)
+        if prices:
+            prices.sort()
+            mid = len(prices) // 2
+            avg = prices[mid] if len(prices) % 2 else (prices[mid-1] + prices[mid]) / 2.0
+            results["avg_ticket_price"] = float(round(avg, 2))
+            results["avg_ticket_price_source"] = f"website:{site_url}"
+            log.info(f"[{row_id}] avg_ticket_price via site median: {results['avg_ticket_price']}")
+
+    # ---------- 6) status ----------
+    if any(k in results for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
+        results["enrichment_status"] = "DONE"
+    else:
+        results["enrichment_status"] = "PENDING"
+        log.info(f"[{row_id}] no evidence found")
+
+    return results
+
+@app.route("/", methods=["GET"])
+def run_once():
+    try:
+        limit = int(request.args.get("limit", "5"))
+    except Exception:
+        limit = 5
+    dry_run = request.args.get("dry_run", "false").lower() in ("1", "true", "yes")
+
+    rows = list(bq.query(row_selector(limit)).result())
+    log.info(f"Processing {len(rows)} rows (dry_run={dry_run})")
+
+    updated = 0
     for r in rows:
         try:
-            enriched, sources = enrich_row(r)
-            update_in_place(r, enriched, sources)
-            processed += 1
+            rec = dict(r.items())
+            patch = enrich_one(rec)
+            if not dry_run and patch:
+                update_row(rec["row"], patch)
+            if patch:
+                updated += 1
         except Exception as e:
-            log.exception(f"Failed row: {r.get('name')}: {e}")
-    return jsonify(processed=processed, status="OK")
+            log.exception(f"row {r.get('row')} failed: {e}")
+
+    return jsonify({"processed": len(rows), "updated": updated, "dry_run": dry_run, "status": "OK"})
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))

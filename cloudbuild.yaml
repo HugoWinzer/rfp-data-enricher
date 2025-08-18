@@ -1,0 +1,33 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _REGION: europe-west1
+  _SERVICE: data-enricher
+
+steps:
+# Build & push image from your GitHub source
+- name: gcr.io/cloud-builders/docker
+  args: ['build', '-t', 'gcr.io/$PROJECT_ID/data-enricher:$SHORT_SHA', '.']
+
+- name: gcr.io/cloud-builders/docker
+  args: ['push', 'gcr.io/$PROJECT_ID/data-enricher:$SHORT_SHA']
+
+# Deploy to Cloud Run; inject secrets at runtime
+- name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+  entrypoint: gcloud
+  args:
+    - run
+    - deploy
+    - ${_SERVICE}
+    - --image=gcr.io/$PROJECT_ID/data-enricher:$SHORT_SHA
+    - --region=${_REGION}
+    - --platform=managed
+    - --allow-unauthenticated
+    - --set-env-vars=PROJECT_ID=rfp-database-464609,DATASET_ID=rfpdata,RAW_TABLE=performing_arts_fixed,STAGING_TABLE=performing_arts_fixed
+    - --set-secrets=OPENAI_API_KEY=openai-api-key:latest
+    - --set-secrets=TICKETMASTER_KEY=ticketmaster-key:latest
+    - --set-secrets=GOOGLE_PLACES_KEY=google-places-key:latest
+
+images:
+- gcr.io/$PROJECT_ID/data-enricher:$SHORT_SHA

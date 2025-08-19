@@ -1,14 +1,14 @@
 # src/gpt_client.py
-import json
+import os, json, logging
 from typing import Dict, Any, Optional
 
 from openai import OpenAI
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+log = logging.getLogger("enricher.gpt")
+_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 _client: Optional[OpenAI] = None
-
-def _client_lazy() -> OpenAI:
+def _client_once() -> OpenAI:
     global _client
     if _client is None:
         _client = OpenAI()
@@ -16,72 +16,61 @@ def _client_lazy() -> OpenAI:
 
 def enrich_with_gpt(row: Dict[str, Any], web_context: str = "") -> Dict[str, Any]:
     """
-    Use OpenAI Chat Completions (>=1.0 API) to fill:
-    - ticket_vendor: str | null
-    - capacity: int | null
-    - avg_ticket_price: number | null
-    Return empty dict on failure.
+    Ask GPT for (avg_ticket_price: number, capacity: integer, ticket_vendor: string|empty)
+    Always returns a dict; values may be None if unknown.
     """
-    name = row.get("name") or ""
-    domain = row.get("domain") or ""
+    name = (row or {}).get("name", "")
+    domain = (row or {}).get("domain", "") or ""
+    prompt = f"""
+You enrich sparse performing-arts org records.
 
-    system = (
-        "You are a careful data enricher. "
-        "Return only strict JSON with keys: ticket_vendor, capacity, avg_ticket_price. "
-        "Use null for unknown."
-    )
+Return STRICT JSON with keys:
+- "avg_ticket_price": a single number in local currency if you can infer it, else null
+- "capacity": integer typical audience capacity if you can infer it, else null
+- "ticket_vendor": one of ["Ticketmaster","Eventbrite","See Tickets","Dice","Universe","Local Box Office","Other",""] — empty string if unknown
 
-    user = f"""
-    Organization: {name}
-    Domain: {domain or "unknown"}
-    Any scraped text (may be empty):
-    ---
-    {web_context or ""}
-    ---
-
-    Instructions:
-    - Infer a likely ticketing vendor if the text strongly suggests one (e.g., Ticketmaster, Eventbrite, Universe, Tickets.com, etc). Else null.
-    - If the venue capacity is stated or strongly implied, return an integer; else null.
-    - If typical ticket prices are mentioned (or you can infer a representative single price), return a number; else null.
-    Respond with pure JSON only.
-    """
+Context (may be partial or noisy):
+- name: {name}
+- domain: {domain}
+- website_text: {web_context[:3000]}
+"""
 
     try:
-        resp = _client_lazy().chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+        resp = _client_once().chat.completions.create(
+            model=_MODEL,
             temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a careful data enricher. Only output valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
         )
-        text = (resp.choices[0].message.content or "").strip()
-        # Best-effort JSON extraction
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start:end+1]
-
-        data = json.loads(text)
-        out: Dict[str, Any] = {
-            "ticket_vendor": data.get("ticket_vendor"),
-            "capacity": data.get("capacity"),
-            "avg_ticket_price": data.get("avg_ticket_price"),
-        }
-        # Normalize bad types from model
-        if out["capacity"] is not None:
-            try:
-                out["capacity"] = int(out["capacity"])
-            except Exception:
-                out["capacity"] = None
-        if out["avg_ticket_price"] is not None:
-            try:
-                out["avg_ticket_price"] = float(out["avg_ticket_price"])
-            except Exception:
-                out["avg_ticket_price"] = None
-        if out["ticket_vendor"]:
-            out["ticket_vendor"] = str(out["ticket_vendor"]).strip()
-        return out
-    except Exception:
-        # Silent failure -> let caller mark NO_DATA
+        raw = resp.choices[0].message.content or "{}"
+        data = json.loads(raw)
+    except Exception as e:
+        log.warning("GPT call failed: %s", str(e))
         return {}
+
+    out: Dict[str, Any] = {}
+    # avg_ticket_price
+    try:
+        v = data.get("avg_ticket_price", None)
+        if isinstance(v, (int, float)) and v > 0:
+            out["avg_ticket_price"] = float(v)
+    except Exception:
+        pass
+    # capacity
+    try:
+        c = data.get("capacity", None)
+        if isinstance(c, (int, float)) and int(c) > 0:
+            out["capacity"] = int(c)
+    except Exception:
+        pass
+    # vendor
+    tv = data.get("ticket_vendor")
+    if isinstance(tv, str):
+        tv = tv.strip()
+        if tv:
+            out["ticket_vendor"] = tv
+
+    return out

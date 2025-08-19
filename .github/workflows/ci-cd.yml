@@ -2,36 +2,48 @@ name: Build & Deploy to Cloud Run
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  build_and_deploy:
+  deploy:
+    permissions:
+      id-token: write
+      contents: read
     runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      SERVICE: ${{ vars.SERVICE_NAME }}
+      REPO: ${{ vars.ARTIFACT_REPO }}
+      IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:${{ github.sha }}
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up GCP
-      uses: google-github-actions/setup-gcloud@v1
-      with:
-        project_id: rfp-database-464609
-        service_account_key: ${{ secrets.GCP_SA_KEY }}
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_ID_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-    - name: Build & push Docker image
-      id: build
-      run: |
-        IMAGE="gcr.io/rfp-database-464609/data-enricher:${{ github.sha }}"
-        gcloud builds submit --tag "$IMAGE" .
-        echo "image=$IMAGE" >> $GITHUB_OUTPUT
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
 
-    - name: Deploy to Cloud Run
-      run: |
-        IMAGE="${{ steps.build.outputs.image }}"
-        gcloud run deploy data-enricher \
-          --image "$IMAGE" \
-          --region us-central1 \
-          --platform managed \
-          --allow-unauthenticated \
-          --set-env-vars \
-PROJECT_ID=rfp-database-464609,DATASET_ID=rfpdata,RAW_TABLE=performing_arts_raw,STAGING_TABLE=performing_arts_enriched_staging,OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & push image
+        run: |
+          docker build -t "${IMAGE}" .
+          docker push "${IMAGE}"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${SERVICE}" \
+            --project "${PROJECT_ID}" \
+            --region "${REGION}" \
+            --image "${IMAGE}" \
+            --allow-unauthenticated \
+            --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_ID=rfpdata,TABLE=performing_arts_fixed \
+            --set-secrets OPENAI_API_KEY=openai-api-key:latest,TICKETMASTER_KEY=ticketmaster-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest

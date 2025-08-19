@@ -1,8 +1,9 @@
-# cloudbuild.yaml
+# Cloud Build: build and deploy to Cloud Run
 substitutions:
   _REGION: europe-west1
   _SERVICE: data-enricher
   _REPO: rfp-enricher
+  _BQ_LOCATION: europe-southwest1
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args: ['build', '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA', '.']
@@ -20,7 +21,7 @@ steps:
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$COMMIT_SHA'
       - '--allow-unauthenticated'
       - '--set-env-vars'
-      - 'PROJECT_ID=$PROJECT_ID,DATASET_ID=rfpdata,TABLE=performing_arts_fixed'
+      - 'PROJECT_ID=$PROJECT_ID,DATASET_ID=rfpdata,TABLE=performing_arts_fixed,BQ_LOCATION=${_BQ_LOCATION}'
       - '--set-secrets'
       - 'OPENAI_API_KEY=openai-api-key:latest,TICKETMASTER_KEY=ticketmaster-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest'
 images:

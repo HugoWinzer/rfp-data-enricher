@@ -1,77 +1,79 @@
-# src/gpt_client.py
-import json
 import os
-from typing import Any, Dict, Optional
+import json
+from typing import Optional, Dict, Any
 
 from openai import OpenAI
 
-# Singleton OpenAI client; honors OPENAI_MAX_RETRIES and OPENAI_TIMEOUT
 _client: Optional[OpenAI] = None
 
-def _get_client() -> OpenAI:
+def _client_or_none() -> Optional[OpenAI]:  # don't crash if key missing
     global _client
-    if _client is None:
-        _client = OpenAI(
-            max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "5")),
-            timeout=float(os.getenv("OPENAI_TIMEOUT", "30")),
-        )
+    if _client is not None:
+        return _client
+    if not os.getenv("OPENAI_API_KEY"):
+        return None
+    _client = OpenAI()
     return _client
 
-def _parse_json(text: str) -> Dict[str, Any]:
-    try:
-        data = json.loads(text or "{}")
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+SYS = (
+    "You are a careful data extractor. "
+    "Given a performing-arts organization, extract: "
+    "ticket_vendor (string like Ticketmaster, Eventbrite, Universe, SeeTickets, etc.), "
+    "capacity (integer), and avg_ticket_price (decimal in local currency). "
+    "If unsure, leave fields null. Output strict JSON with keys "
+    '["ticket_vendor","capacity","avg_ticket_price"].'
+)
 
-def enrich_with_gpt(row: Dict[str, Any], model: str) -> Dict[str, Any]:
+def enrich_with_gpt(*, name: str, row: Dict[str, Any], model: str = "gpt-4o-mini") -> Optional[Dict[str, Any]]:
     """
-    Minimal wrapper around Chat Completions (OpenAI v1).
-    Returns only the fields we care about if present.
+    Ask GPT for structured hints. Safe to call with missing API key – returns None.
     """
-    client = _get_client()
-    messages = [
-        {"role": "system", "content": (
-            "You enrich venue/company rows for performing arts. "
-            "If you cannot determine a field, omit it."
-        )},
-        {"role": "user", "content": (
-            "Given this row JSON, fill any missing fields: "
-            "ticket_vendor (string), capacity (integer), avg_ticket_price (number). "
-            "Return strict JSON with only known keys. Row: " + json.dumps(row, ensure_ascii=False)
-        )},
+    client = _client_or_none()
+    if client is None:
+        return None
+
+    website = row.get("website") or row.get("url") or ""
+    city = row.get("city") or row.get("town") or ""
+    country = row.get("country") or ""
+    desc = f"Name: {name}\nWebsite: {website}\nCity: {city}\nCountry: {country}"
+
+    msg = [
+        {"role": "system", "content": SYS},
+        {"role": "user", "content": f"Extract fields for:\n{desc}\nReturn JSON only."},
     ]
 
     resp = client.chat.completions.create(
         model=model,
-        messages=messages,
-        temperature=0.2,
+        messages=msg,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        timeout=int(os.getenv("OPENAI_TIMEOUT", "30")),
     )
-    content = resp.choices[0].message.content or ""
-    data = _parse_json(content)
+    text = resp.choices[0].message.content.strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
 
+    # Normalize keys
     out: Dict[str, Any] = {}
-    if not isinstance(data, dict):
-        return out
-
     tv = data.get("ticket_vendor")
+    if isinstance(tv, str) and tv.strip():
+        out["ticket_vendor"] = tv.strip()
+
     cap = data.get("capacity")
+    if isinstance(cap, (int, float, str)):
+        try:
+            out["capacity"] = int(float(cap))
+        except Exception:
+            pass
+
     price = data.get("avg_ticket_price")
+    if isinstance(price, (int, float, str)):
+        try:
+            # keep as string/number; caller will convert to Decimal safely
+            out["avg_ticket_price"] = str(price)
+        except Exception:
+            pass
 
-    if tv not in (None, ""):
-        out["ticket_vendor"] = str(tv).strip()
-
-    try:
-        if cap not in (None, ""):
-            out["capacity"] = int(cap)
-    except Exception:
-        pass
-
-    # Keep as-is; caller converts to Decimal safely.
-    try:
-        if price not in (None, ""):
-            out["avg_ticket_price"] = float(price)
-    except Exception:
-        pass
-
-    return out
+    return out or None

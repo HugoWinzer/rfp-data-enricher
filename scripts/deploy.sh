@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# No API keys or secrets hard-coded here!
+# Usage:
+#   PROJECT_ID=rfp-database-464609 REGION=europe-west1 SERVICE=data-enricher ./scripts/deploy.sh
 
-SERVICE="data-enricher"
-IMAGE="gcr.io/$PROJECT_ID/$SERVICE:latest"
+PROJECT_ID="${PROJECT_ID:?set PROJECT_ID}"
+REGION="${REGION:-europe-west1}"
+SERVICE="${SERVICE:-data-enricher}"
 
-echo "🔨 Building image $IMAGE"
-gcloud builds submit --tag "$IMAGE" .
+IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/rfp-enricher/${SERVICE}:manual"
 
-echo "🚀 Deploying to Cloud Run service $SERVICE"
-gcloud run deploy "$SERVICE" \
-  --image "$IMAGE" \
-  --platform managed \
-  --region us-central1 \
+echo "🔨 Building ${IMAGE}"
+gcloud builds submit --tag "${IMAGE}" .
+
+echo "🚀 Deploying ${SERVICE} to ${REGION}"
+gcloud run deploy "${SERVICE}" \
+  --project "${PROJECT_ID}" \
+  --region "${REGION}" \
+  --image "${IMAGE}" \
   --allow-unauthenticated \
-  --set-env-vars PROJECT_ID=$PROJECT_ID,DATASET_ID=$DATASET_ID,RAW_TABLE=$RAW_TABLE,STAGING_TABLE=$STAGING_TABLE,OPENAI_API_KEY=$OPENAI_API_KEY,TICKETMASTER_KEY=$TICKETMASTER_KEY,GOOGLE_PLACES_KEY=$GOOGLE_PLACES_KEY
+  --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_ID=rfpdata,TABLE=performing_arts_fixed \
+  --set-secrets OPENAI_API_KEY=openai-api-key:latest,TICKETMASTER_KEY=ticketmaster-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest
 
-echo "✅ Deployment complete"
+echo "✅ Done"

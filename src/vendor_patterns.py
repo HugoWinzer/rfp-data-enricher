@@ -13,8 +13,8 @@ VENDOR_SIGNATURES: List[VendorSignature] = [
     VendorSignature(
         name="Ticketmaster",
         domains=["ticketmaster.", "ticketmaster.fr", "ticketmaster.com"],
-        script_substrings=["tm.ticketmaster", "ticketmaster.com/widget"],
-        link_keywords=["ticketmaster", "buy tickets", "billetterie", "acheter"]
+        script_substrings=["tm.ticketmaster", "ticketmaster.com/widget", "ticketmaster.eu"],
+        link_keywords=["ticketmaster", "buy tickets", "billetterie", "acheter", "tickets"]
     ),
     VendorSignature(
         name="Eventbrite",
@@ -26,7 +26,7 @@ VENDOR_SIGNATURES: List[VendorSignature] = [
         name="Weezevent",
         domains=["weezevent.", "weezevent.com", "weezevent.fr"],
         script_substrings=["weezevent.com/js/"],
-        link_keywords=["weezevent", "billetterie", "acheter"]
+        link_keywords=["weezevent", "billetterie", "acheter", "reserver"]
     ),
     VendorSignature(
         name="Billetweb",
@@ -70,7 +70,6 @@ VENDOR_SIGNATURES: List[VendorSignature] = [
         script_substrings=["shotgun.live/widget"],
         link_keywords=["shotgun", "tickets"]
     ),
-    # add more as you encounter them…
 ]
 
 # vendor priority if multiple are found (purchase-path first, then this order)

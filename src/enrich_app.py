@@ -1,5 +1,5 @@
 # src/enrich_app.py
-import os, sys, json, decimal, logging, datetime
+import os, sys, json, decimal, logging
 from typing import Dict, Any, Tuple, List
 
 from flask import Flask, request, jsonify
@@ -24,7 +24,6 @@ TABLE_FQN = f"{PROJECT_ID}.{DATASET_ID}.{TABLE}"
 GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY", "")
 TICKETMASTER_KEY = os.getenv("TICKETMASTER_KEY", "")
 EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN", "")  # optional
-
 DEBUG_LOG_N = int(os.getenv("DEBUG_LOG_N", "3"))
 
 # ---------- setup ----------
@@ -52,74 +51,64 @@ def fetch_rows(limit: int) -> List[Dict[str, Any]]:
 
 def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any], sources: Dict[str, str], idx: int = 0):
     """
-    Robust in-place UPDATE:
-      - Only overwrite fields we actually filled (COALESCE with existing DB values).
-      - Compute DONE/NO_DATA *in SQL* based on post-update values so we never get DONE + NULLs.
+    Idempotent update:
+      - Only overwrite a field when we have a non-null value for it.
+      - Compute enrichment_status in SQL from the *post-update* values:
+            DONE    if any of (ticket_vendor, capacity, avg_ticket_price) is non-null
+            NO_DATA otherwise
     """
     name = row["name"]
-
     if idx < DEBUG_LOG_N:
         log.info("GPT parsed for '%s': %s", name, json.dumps(enriched, ensure_ascii=False))
 
-    # Build parameters (always pass, possibly as NULL). We only apply when non-NULL via COALESCE/CASE.
-    def _cap_param():
-        v = enriched.get("capacity")
-        return int(v) if (v is not None and str(v).strip() != "") else None
+    # Always bind parameters (use None if missing) so the CASE/COALESCE expression can reference them safely.
+    pv = enriched.get("ticket_vendor")
+    pc = int(enriched["capacity"]) if enriched.get("capacity") is not None else None
+    pp = as_decimal(enriched["avg_ticket_price"]) if enriched.get("avg_ticket_price") is not None else None
 
     params = [
         bigquery.ScalarQueryParameter("name", "STRING", name),
 
-        bigquery.ScalarQueryParameter("ticket_vendor", "STRING", enriched.get("ticket_vendor")),
+        bigquery.ScalarQueryParameter("ticket_vendor", "STRING", pv),
         bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", sources.get("ticket_vendor_source")),
 
-        bigquery.ScalarQueryParameter("capacity", "INT64", _cap_param()),
+        bigquery.ScalarQueryParameter("capacity", "INT64", pc),
         bigquery.ScalarQueryParameter("capacity_source", "STRING", sources.get("capacity_source")),
 
-        bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC",
-                                      as_decimal(enriched.get("avg_ticket_price")) if enriched.get("avg_ticket_price") is not None else None),
+        bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", pp),
         bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", sources.get("avg_ticket_price_source")),
     ]
 
+    # Static UPDATE — keeps existing values when params are NULL; sets sources only when we set the value.
     q = f"""
     UPDATE `{TABLE_FQN}`
     SET
-      -- write only if we actually found a value
       ticket_vendor = COALESCE(@ticket_vendor, ticket_vendor),
       ticket_vendor_source = CASE
-        WHEN @ticket_vendor IS NOT NULL THEN COALESCE(@ticket_vendor_source, ticket_vendor_source)
-        ELSE ticket_vendor_source
-      END,
+        WHEN @ticket_vendor IS NOT NULL THEN COALESCE(@ticket_vendor_source, 'GPT')
+        ELSE ticket_vendor_source END,
 
       capacity = COALESCE(@capacity, capacity),
       capacity_source = CASE
-        WHEN @capacity IS NOT NULL THEN COALESCE(@capacity_source, capacity_source)
-        ELSE capacity_source
-      END,
+        WHEN @capacity IS NOT NULL THEN COALESCE(@capacity_source, 'GPT')
+        ELSE capacity_source END,
 
       avg_ticket_price = COALESCE(SAFE_CAST(@avg_ticket_price AS NUMERIC), avg_ticket_price),
       avg_ticket_price_source = CASE
-        WHEN @avg_ticket_price IS NOT NULL THEN COALESCE(@avg_ticket_price_source, avg_ticket_price_source)
-        ELSE avg_ticket_price_source
-      END,
+        WHEN @avg_ticket_price IS NOT NULL THEN COALESCE(@avg_ticket_price_source, 'GPT')
+        ELSE avg_ticket_price_source END,
 
-      -- status computed from the post-UPDATE values
       enrichment_status = CASE
-        WHEN COALESCE(@ticket_vendor, ticket_vendor) IS NULL
-         AND COALESCE(@capacity, capacity) IS NULL
-         AND COALESCE(@avg_ticket_price, avg_ticket_price) IS NULL
-        THEN 'NO_DATA'
-        ELSE 'DONE'
-      END,
+        WHEN (COALESCE(@ticket_vendor, ticket_vendor) IS NOT NULL)
+          OR (COALESCE(@capacity, capacity) IS NOT NULL)
+          OR (COALESCE(SAFE_CAST(@avg_ticket_price AS NUMERIC), avg_ticket_price) IS NOT NULL)
+        THEN 'DONE' ELSE 'NO_DATA' END,
 
       last_updated = CURRENT_TIMESTAMP()
-    WHERE name = @name
+    WHERE name=@name
     """
-
     BQ.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
-
-    changed = [k for k in ("ticket_vendor","capacity","avg_ticket_price") if enriched.get(k) is not None]
-    log.info("APPLY UPDATE for %s -> %s", name,
-             ["enrichment_status","last_updated", *changed])
+    log.info("APPLY UPDATE for %s -> status computed in SQL", name)
 
 # ---------- enrichment pipeline ----------
 def enrich_row(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
@@ -137,13 +126,13 @@ def enrich_row(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
             sources["ticket_vendor_source"] = "Website"
 
         cap = extract_capacity_from_html(html)
-        if cap is not None and len(cap) > 0 and enriched.get("capacity") is None:
+        if cap and enriched.get("capacity") is None:
             enriched["capacity"] = cap[0]
             sources["capacity_source"] = "Website"
 
         prices = extract_prices_from_html(html)
         if prices and enriched.get("avg_ticket_price") is None:
-            enriched["avg_ticket_price"] = sum(prices) / len(prices)
+            enriched["avg_ticket_price"] = float(sum(prices) / len(prices))
             sources["avg_ticket_price_source"] = "Website"
 
     # 2) Google Places price_level → rough price proxy (optional)
@@ -170,7 +159,7 @@ def enrich_row(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
             if not enriched.get("avg_ticket_price"):
                 median_min = tm_median_min_price(tm)
                 if median_min:
-                    enriched["avg_ticket_price"] = median_min
+                    enriched["avg_ticket_price"] = float(median_min)
                     sources["avg_ticket_price_source"] = "Ticketmaster"
         except Exception:
             pass
@@ -178,11 +167,14 @@ def enrich_row(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
     # 4) GPT fallback to fill any remaining fields
     missing = [k for k in ("avg_ticket_price", "capacity", "ticket_vendor") if enriched.get(k) is None]
     if missing and os.getenv("OPENAI_API_KEY"):
-        gpt_out = enrich_with_gpt(raw, web_context=text)
-        for k in missing:
-            if gpt_out.get(k) is not None and enriched.get(k) is None:
-                enriched[k] = gpt_out[k]
-                sources[f"{k}_source"] = "GPT"
+        try:
+            gpt_out = enrich_with_gpt(raw, web_context=text)
+            for k in missing:
+                if gpt_out.get(k) is not None and enriched.get(k) is None:
+                    enriched[k] = gpt_out[k]
+                    sources[f"{k}_source"] = "GPT"
+        except Exception as e:
+            log.warning("gpt failed: %s", str(e))
 
     return enriched, sources
 
@@ -213,5 +205,4 @@ def run_batch():
     return jsonify(processed=processed, status="OK")
 
 if __name__ == "__main__":
-    # local dev only; Cloud Run uses gunicorn CMD in Dockerfile
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))

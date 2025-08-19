@@ -1,145 +1,116 @@
-import os
+# src/gpt_client.py
 import json
-import logging
-from typing import Dict, Any, Optional
+import os
+from typing import Any, Dict
 
 from openai import OpenAI
 
-log = logging.getLogger("enricher")
+_client = None
 
-# You can override the model via env if needed
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-_client = OpenAI()
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI()  # uses OPENAI_API_KEY from env
+    return _client
 
-
-def _to_int(x) -> Optional[int]:
-    try:
-        if x is None or x == "":
-            return None
-        if isinstance(x, str):
-            # keep digits only (tolerate "1,200 seats")
-            s = "".join(ch for ch in x if ch.isdigit())
-            if not s:
-                return None
-            x = int(s)
-        return int(x)
-    except Exception:
-        return None
-
-
-def _to_float(x) -> Optional[float]:
-    try:
-        if x is None or x == "":
-            return None
-        if isinstance(x, str):
-            # keep digits and punctuation, normalize comma to dot
-            s = "".join(ch for ch in x if ch.isdigit() or ch in ".,").replace(",", ".")
-            if not s or s.count(".") > 1:
-                return None
-            x = float(s)
-        return float(x)
-    except Exception:
-        return None
-
-
-def _extract_output_text(resp) -> str:
-    """Best-effort text extraction that works across minor SDK variations."""
-    try:
-        t = getattr(resp, "output_text", None)
-        if t:
-            return t
-    except Exception:
-        pass
-    try:
-        # Fallback path
-        outputs = getattr(resp, "output", None) or getattr(resp, "outputs", None)
-        if outputs:
-            first = outputs[0]
-            content = getattr(first, "content", None)
-            if content and len(content) > 0 and hasattr(content[0], "text"):
-                return content[0].text
-    except Exception:
-        pass
-    return ""
-
-
-def enrich_with_gpt(raw: Dict[str, Any], web_context: Optional[str] = None) -> Dict[str, Any]:
+def _parse_json(text: str) -> Dict[str, Any]:
     """
-    Ask the model to fill:
-      - ticket_vendor: string|null
-      - capacity: integer|null
-      - avg_ticket_price: number|null
-    Only fill when confident; otherwise return nulls.
+    Try to parse a JSON object out of the model output.
+    Accepts bare JSON or a fenced code block.
     """
-    name = (raw.get("name") or "").strip()
-    domain = (raw.get("domain") or "").strip()
-    city = (raw.get("city") or "").strip()
-    country = (raw.get("country") or "").strip()
-    ctx = (web_context or "").strip()
-
-    system = (
-        "You enrich performing arts venue data. "
-        "Only fill a field if you are highly confident; otherwise return null. "
-        "Do not invent data. If the website text suggests a range, return the most typical value."
-    )
-
-    # Strict JSON schema to make downstream parsing robust
-    schema = {
-        "name": "venue_enrichment",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "ticket_vendor": {"type": ["string", "null"]},
-                "capacity": {"type": ["integer", "null"]},
-                "avg_ticket_price": {"type": ["number", "null"]},
-            },
-            "required": ["ticket_vendor", "capacity", "avg_ticket_price"],
-            "additionalProperties": False,
-        },
-    }
-
-    user = (
-        "Fill these fields for the venue record only if confident; else return nulls.\n\n"
-        f"Record:\n"
-        f"- name: {name}\n"
-        f"- domain: {domain}\n"
-        f"- city: {city}\n"
-        f"- country: {country}\n\n"
-        f"Website text (may be empty):\n{ctx[:8000]}"
-    )
-
-    try:
-        resp = _client.responses.create(
-            model=OPENAI_MODEL,
-            response_format={"type": "json_schema", "json_schema": schema},
-            input=[
-                {"role": "system", "content": [{"type": "text", "text": system}]},
-                {"role": "user", "content": [{"type": "text", "text": user}]},
-            ],
-            max_output_tokens=300,
-        )
-        text = _extract_output_text(resp)
-        data = json.loads(text or "{}")
-    except Exception as e:
-        log.warning("GPT enrichment failed for '%s': %s", name, e)
+    if not text:
         return {}
+    text = text.strip()
+
+    # Extract JSON from ```json ... ``` if present
+    if "```" in text:
+        parts = text.split("```")
+        for p in parts:
+            pt = p.strip()
+            if pt.lower().startswith("json"):
+                pt = pt[4:].strip()
+            if pt.startswith("{") and pt.endswith("}"):
+                try:
+                    return json.loads(pt)
+                except Exception:
+                    pass
+
+    # Fall back to direct parse
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+    return {}
+
+def enrich_with_gpt(row: Dict[str, Any], web_context: str = "") -> Dict[str, Any]:
+    """
+    Ask the model to fill any of:
+      - ticket_vendor (str or null)
+      - capacity (int or null)
+      - avg_ticket_price (float or null)
+
+    Returns a dict with some/all of those keys.
+    """
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    # Single-string prompt works well with the Responses API
+    prompt = f"""
+You are a precise data enricher for performing arts venues.
+Given a row of metadata and (optional) scraped site text, infer:
+- ticket_vendor: standard vendor name if confidently present, else null
+- capacity: integer if confidently present, else null
+- avg_ticket_price: typical single-ticket price in local currency as a float if confidently present, else null
+
+Return ONLY compact JSON with exactly these keys:
+{{
+  "ticket_vendor": <string or null>,
+  "capacity": <int or null>,
+  "avg_ticket_price": <float or null>
+}}
+
+Row JSON:
+{json.dumps(row, ensure_ascii=False, indent=2)}
+
+Scraped site text (may be empty):
+{web_context[:6000]}
+"""
+
+    client = _get_client()
+    resp = client.responses.create(model=model, input=prompt)
+
+    text = getattr(resp, "output_text", None)
+    if not text and getattr(resp, "output", None):
+        try:
+            # Older SDK objects may expose a list of content parts
+            text = resp.output[0].content[0].text
+        except Exception:
+            text = None
+
+    data = _parse_json(text or "")
 
     out: Dict[str, Any] = {}
+    if isinstance(data, dict):
+        tv = data.get("ticket_vendor")
+        cap = data.get("capacity")
+        price = data.get("avg_ticket_price")
 
-    # ticket_vendor
-    tv = (data.get("ticket_vendor") or "").strip() if isinstance(data.get("ticket_vendor"), str) else None
-    if tv:
-        out["ticket_vendor"] = tv[:64]
+        if isinstance(tv, str) and tv.strip():
+            out["ticket_vendor"] = tv.strip()
 
-    # capacity
-    cap = _to_int(data.get("capacity"))
-    if cap and cap > 0:
-        out["capacity"] = cap
+        # capacity → int
+        try:
+            if cap is not None:
+                out["capacity"] = int(cap)
+        except Exception:
+            pass
 
-    # avg_ticket_price
-    price = _to_float(data.get("avg_ticket_price"))
-    if price and price > 0:
-        out["avg_ticket_price"] = round(price, 2)
+        # avg_ticket_price → float
+        try:
+            if price is not None:
+                out["avg_ticket_price"] = float(price)
+        except Exception:
+            pass
 
     return out

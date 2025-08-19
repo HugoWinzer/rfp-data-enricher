@@ -1,4 +1,3 @@
-cat > src/enrich_app.py <<'PY'
 #!/usr/bin/env python3
 import os
 import logging
@@ -21,14 +20,15 @@ log = logging.getLogger(__name__)
 PROJECT_ID   = os.getenv("PROJECT_ID")
 DATASET_ID   = os.getenv("DATASET_ID", "rfpdata")
 TABLE        = os.getenv("TABLE", "performing_arts_fixed")
-BQ_LOCATION  = os.getenv("BQ_LOCATION", "EU")  # <- set this to match your dataset exactly
+BQ_LOCATION  = os.getenv("BQ_LOCATION")  # REQUIRED: exact dataset location (e.g. EU or europe-southwest1)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
+if not BQ_LOCATION:
+    raise RuntimeError("BQ_LOCATION env var is required (match your dataset location, e.g. 'EU' or 'europe-southwest1')")
 
-# Helpful default on the client; still pass location= on every query call.
-bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+bq = bigquery.Client(project=PROJECT_ID)
 
 app = Flask(__name__)
 
@@ -45,7 +45,7 @@ def _to_decimal(value):
     if isinstance(value, Decimal):
         return value
     try:
-        return Decimal(str(value))  # avoid float -> NUMERIC directly
+        return Decimal(str(value))  # Avoid passing float directly to NUMERIC
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -62,7 +62,8 @@ def fetch_rows(limit: int):
     """
     params = [bigquery.ScalarQueryParameter("limit", "INT64", limit)]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)  # <-- pass location here
+    # IMPORTANT: pass location on the query call; do NOT set job_config.location
+    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)
     return list(job.result())
 
 def _build_update_sql(for_fields):
@@ -128,7 +129,7 @@ def update_in_place(row, enriched: dict):
     sql = _build_update_sql(set(fields_to_set))
     log.info("APPLY UPDATE for %s -> %s", name, fields_to_set)
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()  # <-- pass location here
+    bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()
 
 def run_batch(limit: int) -> int:
     rows = fetch_rows(limit)
@@ -184,4 +185,3 @@ def root():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-PY

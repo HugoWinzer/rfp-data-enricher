@@ -1,5 +1,5 @@
 # src/enrich_app.py
-import os, sys, json, decimal, logging, datetime
+import os, sys, json, decimal, logging
 from typing import Dict, Any, Tuple, List
 
 from flask import Flask, request, jsonify
@@ -86,13 +86,14 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any], sources: Dict
             bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", sources.get("avg_ticket_price_source", "GPT")),
         ]
 
+    # status
     filled_any = any(enriched.get(k) not in (None, "") for k in ("ticket_vendor", "capacity", "avg_ticket_price"))
     status = "DONE" if filled_any else "NO_DATA"
     set_fields += ["enrichment_status=@enrichment_status", "last_updated=CURRENT_TIMESTAMP()"]
     params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", status))
 
     if not set_fields:
-        # still set status/last_updated so the row doesn't starve
+        # should never happen, but make sure we still bump last_updated
         set_fields = ["enrichment_status=@enrichment_status", "last_updated=CURRENT_TIMESTAMP()"]
 
     q = f"""

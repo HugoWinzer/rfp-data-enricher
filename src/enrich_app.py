@@ -3,15 +3,16 @@ import os
 import json
 import logging
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
 try:
-    from .gpt_client import enrich_with_gpt  # when run by gunicorn: package style
+    # when run by gunicorn (package style)
+    from .gpt_client import enrich_with_gpt
 except Exception:
-    from gpt_client import enrich_with_gpt  # when run directly
+    # when run directly
+    from gpt_client import enrich_with_gpt
 
 # ------------------------------------------------------------------------------
 # Config & globals
@@ -29,7 +30,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
 
-bq = bigquery.Client(project=PROJECT_ID)
+# Set location on the client (not on QueryJobConfig)
+bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
 app = Flask(__name__)
 
@@ -64,7 +66,7 @@ def fetch_rows(limit: int):
     """
     params = [bigquery.ScalarQueryParameter("limit", "INT64", limit)]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)
+    job = bq.query(sql, job_config=job_config)  # location already on client
     return list(job.result())
 
 def _build_update_sql(for_fields):
@@ -130,7 +132,7 @@ def update_in_place(row, enriched: dict):
     sql = _build_update_sql(set(for_fields := fields_to_set))
     log.info("APPLY UPDATE for %s -> %s", name, for_fields)
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()
+    bq.query(sql, job_config=job_config).result()  # location already on client
 
 def run_batch(limit: int) -> int:
     rows = fetch_rows(limit)
@@ -139,8 +141,8 @@ def run_batch(limit: int) -> int:
         try:
             name = r["name"]
         except Exception:
-            # fallback if column named differently
             name = r.get("organization_name") if isinstance(r, dict) else None
+
         enriched = {"enrichment_status": "NO_DATA"}
         try:
             suggestion = enrich_with_gpt(name=name, row=dict(r), model=OPENAI_MODEL)
@@ -184,6 +186,5 @@ def root():
 # ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Local dev: run Flask directly
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

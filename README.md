@@ -1,31 +1,21 @@
-# RFP Data Enricher
+# RFP Data Enricher (Cloud Run)
 
-**Goal:**  
-Read raw venue rows from BigQuery, call the OpenAI API to extract hard-to-find fields  
-(avg_ticket_price, capacity, ticket_vendor, annual_revenue, ticketing_revenue),  
-and write them back into an enriched staging table.
+Small Flask service that enriches BigQuery rows using OpenAI.
 
----
+## Endpoints
+- `GET /healthz` → `ok`
+- `GET /?limit=25` → runs a batch (1–100)
 
-## Repo Layout
+## Required env
+- `PROJECT_ID=rfp-database-464609`
+- `DATASET_ID=rfpdata`
+- `TABLE=performing_arts_fixed`
+- `BQ_LOCATION=europe-southwest1`
+- `OPENAI_API_KEY` (secret)
+- `OPENAI_MODEL` (default `gpt-4o-mini`)
 
-## Usage
-
-1. **Edit code** in this GitHub repo.  
-2. In Cloud Shell:
-    ```bash
-    git clone https://github.com/HugoWinzer/rfp-data-enricher.git
-    cd rfp-data-enricher
-    export OPENAI_API_KEY="sk-…"
-    ./scripts/deploy.sh
-    ```
-   This builds the container and deploys to Cloud Run automatically.
-
-## Required Environment Variables
-
-- `PROJECT_ID` (e.g. `rfp-database-464609`)  
-- `DATASET_ID` (e.g. `rfpdata`)  
-- `RAW_TABLE` (e.g. `performing_arts_raw` or `museums_raw`)  
-- `STAGING_TABLE` (e.g. `performing_arts_enriched_staging`)  
-- `OPENAI_API_KEY`
-
+## Local run
+```bash
+pip install -r requirements.txt
+export PROJECT_ID=rfp-database-464609 DATASET_ID=rfpdata TABLE=performing_arts_fixed BQ_LOCATION=europe-southwest1 OPENAI_API_KEY=...
+python -m src.enrich_app

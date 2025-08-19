@@ -15,6 +15,7 @@ jobs:
       REGION: ${{ vars.GCP_REGION }}
       SERVICE: ${{ vars.SERVICE_NAME }}
       REPO: ${{ vars.ARTIFACT_REPO }}
+      BQ_LOCATION: ${{ vars.BQ_LOCATION }} # set to europe-southwest1
       IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO }}/${{ env.SERVICE }}:${{ github.sha }}
 
     steps:
@@ -44,5 +45,5 @@ jobs:
             --region "${REGION}" \
             --image "${IMAGE}" \
             --allow-unauthenticated \
-            --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_ID=rfpdata,RAW_TABLE=performing_arts_fixed,STAGING_TABLE=performing_arts_fixed \
+            --set-env-vars PROJECT_ID=${PROJECT_ID},DATASET_ID=rfpdata,TABLE=performing_arts_fixed,BQ_LOCATION=${BQ_LOCATION} \
             --set-secrets OPENAI_API_KEY=openai-api-key:latest,TICKETMASTER_KEY=ticketmaster-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest

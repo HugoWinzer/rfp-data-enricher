@@ -1,200 +1,286 @@
-# src/enrich_app.py
-import os, sys, json, decimal, logging
-from typing import Dict, Any, Tuple, List
+import os
+import json
+import logging
+from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
+from openai import OpenAI
 
-from .gpt_client import enrich_with_gpt
-from .extractors import (
-    scrape_website_text,
-    detect_vendor_signals,
-    choose_best_vendor,
-    places_text_search, places_details,
-    tm_search_events, tm_median_min_price, tm_is_vendor_present,
-    normalize_name, extract_capacity_from_html, extract_prices_from_html,
-)
+# ------------------------------------------------------------------------------
+# Config & globals
+# ------------------------------------------------------------------------------
 
-# ---------- env ----------
-PROJECT_ID = os.environ["PROJECT_ID"]
-DATASET_ID = os.environ["DATASET_ID"]
-TABLE = os.getenv("TABLE") or os.getenv("STAGING_TABLE", "performing_arts_fixed")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+PROJECT_ID = os.environ.get("PROJECT_ID")
+DATASET_ID = os.environ.get("DATASET_ID", "rfpdata")
+TABLE = os.environ.get("TABLE", "performing_arts_fixed")
 TABLE_FQN = f"{PROJECT_ID}.{DATASET_ID}.{TABLE}"
 
-GOOGLE_PLACES_KEY = os.getenv("GOOGLE_PLACES_KEY", "")
-TICKETMASTER_KEY = os.getenv("TICKETMASTER_KEY", "")
-EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN", "")  # optional
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+BQ_LOCATION = os.environ.get("BQ_LOCATION")  # e.g. "EU" or "europe-west1"
 
-DEBUG_LOG_N = int(os.getenv("DEBUG_LOG_N", "3"))
+# BigQuery client (ADC)
+bq = bigquery.Client(project=PROJECT_ID)
+# OpenAI client (reads OPENAI_API_KEY from env)
+oa = OpenAI()
 
-# ---------- setup ----------
-logging.basicConfig(stream=sys.stdout, level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("enricher")
-BQ = bigquery.Client(project=PROJECT_ID)
+app = Flask(__name__)
 
-# ---------- helpers ----------
-def as_decimal(val):
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+def _to_decimal(val):
+    """Safely convert to Decimal for BigQuery NUMERIC."""
     if val is None:
         return None
-    return decimal.Decimal(str(val))
+    try:
+        # stringify to avoid float artifacts
+        return Decimal(str(val))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
-def fetch_rows(limit: int) -> List[Dict[str, Any]]:
-    # pull not-DONE rows first by oldest last_updated
+
+def gpt_enrich(row):
+    """
+    Call OpenAI Chat Completions (v1 API) to try to infer missing fields.
+    Returns: (enriched: dict, sources: dict)
+
+    enriched keys we may set:
+      - ticket_vendor (str)
+      - capacity (int)
+      - avg_ticket_price (Decimal/str/float -> converted later)
+      - enrichment_status ('DONE' | 'NO_DATA')
+
+    sources keys:
+      - ticket_vendor_source
+      - capacity_source
+      - avg_ticket_price_source
+    """
+    messages = [
+        {"role": "system", "content": (
+            "You are an assistant that enriches venue/company rows for performing arts. "
+            "If you cannot determine a field, leave it blank."
+        )},
+        {"role": "user", "content": (
+            "Given this row JSON, fill any missing fields: ticket_vendor (string name), "
+            "capacity (integer), avg_ticket_price (numeric, average local currency). "
+            "Return strict JSON with keys you know. Row: "
+            + json.dumps(row, ensure_ascii=False)
+        )}
+    ]
+
+    try:
+        resp = oa.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content or ""
+    except Exception as e:
+        log.warning("gpt failed: \n%s", e)
+        # fall back: we couldn't enrich
+        return (
+            {"enrichment_status": "NO_DATA"},
+            {}
+        )
+
+    # Parse JSON if possible
+    try:
+        data = json.loads(content)
+        enriched = {}
+        sources = {}
+
+        if isinstance(data, dict):
+            tv = data.get("ticket_vendor")
+            cap = data.get("capacity")
+            price = data.get("avg_ticket_price")
+
+            if tv:
+                enriched["ticket_vendor"] = str(tv).strip()
+                sources["ticket_vendor_source"] = "GPT"
+
+            if cap not in (None, ""):
+                try:
+                    enriched["capacity"] = int(cap)
+                    sources["capacity_source"] = "GPT"
+                except Exception:
+                    pass
+
+            if price not in (None, ""):
+                # leave as raw; we'll cast to Decimal in update
+                enriched["avg_ticket_price"] = price
+                sources["avg_ticket_price_source"] = "GPT"
+
+        if any(k in enriched for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
+            enriched["enrichment_status"] = "DONE"
+        else:
+            enriched["enrichment_status"] = "NO_DATA"
+
+        return enriched, sources
+
+    except Exception:
+        # model responded non-JSON; mark as no data
+        return ({"enrichment_status": "NO_DATA"}, {})
+
+
+def fetch_rows(limit: int):
+    """
+    Pull a small batch of rows that still need enrichment.
+    Strategy: any record missing any of the 3 fields and not already NO_DATA recently.
+    """
     sql = f"""
-    SELECT *
+    SELECT
+      *
     FROM `{TABLE_FQN}`
-    WHERE COALESCE(enrichment_status,'PENDING')!='DONE'
-    ORDER BY last_updated IS NULL DESC, last_updated ASC
-    LIMIT {int(limit)}
+    WHERE
+      (ticket_vendor IS NULL OR capacity IS NULL OR avg_ticket_price IS NULL)
+      AND (enrichment_status IS NULL OR enrichment_status != 'NO_DATA')
+    LIMIT @limit
     """
-    return [dict(r) for r in BQ.query(sql).result()]
 
-def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any], sources: Dict[str, str], idx: int = 0):
+    params = [bigquery.ScalarQueryParameter("limit", "INT64", int(limit))]
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    if BQ_LOCATION:
+        job_config.location = BQ_LOCATION
+
+    return list(bq.query(sql, job_config=job_config).result())
+
+
+def update_in_place(row, enriched: dict, sources: dict):
     """
-    - Only mark DONE if at least one of {ticket_vendor, capacity, avg_ticket_price} is set.
-    - Otherwise mark NO_DATA.
+    Build a single UPDATE with only the fields we have, including sources and last_updated.
+    Uses typed parameters (NUMERIC via Decimal) and pins job location.
     """
-    name = row["name"]
-    if idx < DEBUG_LOG_N:
-        log.info("GPT parsed for '%s': %s", name, json.dumps(enriched, ensure_ascii=False))
+    sets = ["last_updated = CURRENT_TIMESTAMP()"]
+    params = []
 
-    set_fields = []
-    params = [bigquery.ScalarQueryParameter("name", "STRING", name)]
+    # ticket_vendor
+    if enriched.get("ticket_vendor") is not None:
+        sets.append("ticket_vendor = @ticket_vendor")
+        params.append(bigquery.ScalarQueryParameter("ticket_vendor", "STRING", enriched["ticket_vendor"]))
+        # source column
+        src = sources.get("ticket_vendor_source")
+        if src:
+            sets.append("ticket_vendor_source = @ticket_vendor_source")
+            params.append(bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", src))
 
-    if enriched.get("ticket_vendor"):
-        set_fields += ["ticket_vendor=@ticket_vendor", "ticket_vendor_source=@ticket_vendor_source"]
-        params += [
-            bigquery.ScalarQueryParameter("ticket_vendor", "STRING", enriched["ticket_vendor"]),
-            bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", sources.get("ticket_vendor_source", "GPT")),
-        ]
-
+    # capacity (INT64)
     if enriched.get("capacity") is not None:
-        set_fields += ["capacity=@capacity", "capacity_source=@capacity_source"]
-        params += [
-            bigquery.ScalarQueryParameter("capacity", "INT64", int(enriched["capacity"])),
-            bigquery.ScalarQueryParameter("capacity_source", "STRING", sources.get("capacity_source", "GPT")),
-        ]
+        sets.append("capacity = @capacity")
+        params.append(bigquery.ScalarQueryParameter("capacity", "INT64", int(enriched["capacity"])))
+        src = sources.get("capacity_source")
+        if src:
+            sets.append("capacity_source = @capacity_source")
+            params.append(bigquery.ScalarQueryParameter("capacity_source", "STRING", src))
 
+    # avg_ticket_price (NUMERIC) — must be Decimal
     if enriched.get("avg_ticket_price") is not None:
-        set_fields += [
-            "avg_ticket_price=SAFE_CAST(@avg_ticket_price AS NUMERIC)",
-            "avg_ticket_price_source=@avg_ticket_price_source",
-        ]
-        params += [
-            bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", as_decimal(enriched["avg_ticket_price"])),
-            bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", sources.get("avg_ticket_price_source", "GPT")),
-        ]
+        price_dec = _to_decimal(enriched["avg_ticket_price"])
+        sets.append("avg_ticket_price = CAST(@avg_ticket_price AS NUMERIC)")
+        params.append(bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", price_dec))
+        src = sources.get("avg_ticket_price_source")
+        if src:
+            sets.append("avg_ticket_price_source = @avg_ticket_price_source")
+            params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", src))
 
-    # status
-    filled_any = any(enriched.get(k) not in (None, "") for k in ("ticket_vendor", "capacity", "avg_ticket_price"))
-    status = "DONE" if filled_any else "NO_DATA"
-    set_fields += ["enrichment_status=@enrichment_status", "last_updated=CURRENT_TIMESTAMP()"]
-    params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", status))
+    # enrichment_status (STRING)
+    if enriched.get("enrichment_status") is not None:
+        sets.append("enrichment_status = @enrichment_status")
+        params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", enriched["enrichment_status"]))
 
-    if not set_fields:
-        # should never happen, but make sure we still bump last_updated
-        set_fields = ["enrichment_status=@enrichment_status", "last_updated=CURRENT_TIMESTAMP()"]
+    if len(sets) == 1:
+        # nothing to update except timestamp; still write timestamp + NO_DATA if we can
+        sets.append("enrichment_status = COALESCE(@enrichment_status, enrichment_status)")
+        params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", enriched.get("enrichment_status", "NO_DATA")))
+
+    # Define the primary key to identify the row. Adjust this WHERE clause to your schema (id vs name, etc).
+    # Here we assume there is a stable string key column called "name".
+    where_col = "name"
+    key_val = row.get(where_col) if isinstance(row, dict) else getattr(row, where_col, None)
+    if key_val is None:
+        # fallback: try id
+        where_col = "id"
+        key_val = row.get(where_col) if isinstance(row, dict) else getattr(row, where_col, None)
+
+    if key_val is None:
+        raise RuntimeError("Cannot identify row key: expected 'name' or 'id' in table.")
+
+    params.append(bigquery.ScalarQueryParameter("key", "STRING", str(key_val)))
 
     q = f"""
     UPDATE `{TABLE_FQN}`
-    SET {", ".join(set_fields)}
-    WHERE name=@name
+    SET {", ".join(sets)}
+    WHERE {where_col} = @key
     """
-    BQ.query(q, job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
-    log.info("APPLY UPDATE for %s -> %s", name, set_fields)
 
-# ---------- enrichment pipeline ----------
-def enrich_row(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    name = raw.get("name") or ""
-    enriched: Dict[str, Any] = {}
-    sources: Dict[str, str] = {}
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    if BQ_LOCATION:
+        job_config.location = BQ_LOCATION
 
-    # 1) Try website vendor / capacity / price hints
-    html, text = scrape_website_text(raw.get("domain"))
-    if html:
-        signals = detect_vendor_signals(html, f"http://{raw.get('domain')}" if raw.get("domain") else "")
-        best = choose_best_vendor(signals)
-        if best and not enriched.get("ticket_vendor"):
-            enriched["ticket_vendor"] = best["vendor"]
-            sources["ticket_vendor_source"] = "Website"
+    bq.query(q, job_config=job_config).result()
 
-        cap = extract_capacity_from_html(html)
-        if cap and enriched.get("capacity") is None:
-            enriched["capacity"] = cap[0]
-            sources["capacity_source"] = "Website"
+    changed_cols = [frag.split("=")[0].strip() for frag in sets]
+    log.info("APPLY UPDATE for %s -> %s", key_val, changed_cols)
 
-        prices = extract_prices_from_html(html)
-        if prices and enriched.get("avg_ticket_price") is None:
-            enriched["avg_ticket_price"] = sum(prices) / len(prices)
-            sources["avg_ticket_price_source"] = "Website"
 
-    # 2) Google Places price_level → rough price proxy (optional)
-    if GOOGLE_PLACES_KEY and not enriched.get("avg_ticket_price"):
-        try:
-            result = places_text_search(GOOGLE_PLACES_KEY, name) or {}
-            if result.get("place_id"):
-                details = places_details(GOOGLE_PLACES_KEY, result["place_id"]) or {}
-                price_level = details.get("price_level")
-                if isinstance(price_level, int):
-                    # heuristic: 0..4 mapped to ~€10..€90
-                    enriched["avg_ticket_price"] = float(price_level * 20 + 10)
-                    sources["avg_ticket_price_source"] = "Google Places"
-        except Exception:
-            pass
-
-    # 3) Ticketmaster events heuristics (optional)
-    if TICKETMASTER_KEY:
-        try:
-            tm = tm_search_events(TICKETMASTER_KEY, name)
-            if not enriched.get("ticket_vendor") and tm_is_vendor_present(tm, normalize_name(name)):
-                enriched["ticket_vendor"] = "Ticketmaster"
-                sources["ticket_vendor_source"] = "Ticketmaster"
-            if not enriched.get("avg_ticket_price"):
-                median_min = tm_median_min_price(tm)
-                if median_min:
-                    enriched["avg_ticket_price"] = median_min
-                    sources["avg_ticket_price_source"] = "Ticketmaster"
-        except Exception:
-            pass
-
-    # 4) GPT fallback to fill any remaining fields
-    missing = [k for k in ("avg_ticket_price", "capacity", "ticket_vendor") if enriched.get(k) is None]
-    if missing and os.getenv("OPENAI_API_KEY"):
-        gpt_out = enrich_with_gpt(raw, web_context=text)
-        for k in missing:
-            if gpt_out.get(k) is not None and enriched.get(k) is None:
-                enriched[k] = gpt_out[k]
-                sources[f"{k}_source"] = "GPT"
-
-    return enriched, sources
-
-# ---------- Flask app ----------
-app = Flask(__name__)
-
-@app.route("/healthz")
-def healthz():
-    return "ok", 200
-
-@app.route("/", methods=["GET"])
-def run_batch():
-    try:
-        limit = int(request.args.get("limit", "10"))
-    except Exception:
-        return jsonify(error="invalid limit"), 400
-
-    log.info("=== UPDATE MODE: no inserts; BigQuery UPDATE only ===")
+def run_batch(limit: int):
     rows = fetch_rows(limit)
+    log.info("=== UPDATE MODE: no inserts; BigQuery UPDATE only ===")
     log.info("Processing %d rows", len(rows))
 
     processed = 0
-    for idx, r in enumerate(rows):
-        enriched, sources = enrich_row(r)
-        update_in_place(r, enriched, sources, idx)
-        processed += 1
+    for r in rows:
+        # convert Row to dict for prompt + updates
+        row_dict = dict(r.items()) if hasattr(r, "items") else dict(r)
+        enriched, sources = gpt_enrich(row_dict)
+        try:
+            update_in_place(row_dict, enriched, sources)
+            processed += 1
+        except Exception as e:
+            key = row_dict.get("name") or row_dict.get("id")
+            log.error("Failed row: %s: %s", key, e)
 
-    return jsonify(processed=processed, status="OK")
+    return processed
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
+
+
+@app.get("/")
+def root():
+    """
+    Trigger a small enrichment batch.
+    Example: GET /?limit=25
+    """
+    try:
+        limit = int(request.args.get("limit", "25"))
+        limit = max(1, min(limit, 100))  # safety clamp
+    except Exception:
+        limit = 25
+
+    try:
+        count = run_batch(limit)
+        return jsonify({"processed": count, "status": "OK"}), 200
+    except Exception as e:
+        log.exception("Batch failed")
+        return jsonify({"processed": 0, "status": "ERROR", "error": str(e)}), 500
+
+
+# ------------------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # local dev only; Cloud Run uses gunicorn CMD in Dockerfile
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    # Local dev: run Flask directly
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)

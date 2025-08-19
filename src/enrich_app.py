@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 import os
-import json
 import logging
 from decimal import Decimal, InvalidOperation
-
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
 try:
-    # when run by gunicorn (package style)
-    from .gpt_client import enrich_with_gpt
+    from .gpt_client import enrich_with_gpt  # package import (gunicorn)
 except Exception:
-    # when run directly
-    from gpt_client import enrich_with_gpt
+    from gpt_client import enrich_with_gpt    # direct run
 
 # ------------------------------------------------------------------------------
 # Config & globals
@@ -24,13 +20,13 @@ log = logging.getLogger(__name__)
 PROJECT_ID   = os.getenv("PROJECT_ID")
 DATASET_ID   = os.getenv("DATASET_ID", "rfpdata")
 TABLE        = os.getenv("TABLE", "performing_arts_fixed")
-BQ_LOCATION  = os.getenv("BQ_LOCATION", "europe-southwest1")
+BQ_LOCATION  = os.getenv("BQ_LOCATION", "EU")  # <-- make sure this matches your dataset
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
 
-# Set location on the client (not on QueryJobConfig)
+# Set default location on the client (helps non-query ops) and still pass location= on queries.
 bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
 app = Flask(__name__)
@@ -48,8 +44,7 @@ def _to_decimal(value):
     if isinstance(value, Decimal):
         return value
     try:
-        # Ensure we never pass float to NUMERIC
-        return Decimal(str(value))
+        return Decimal(str(value))  # never pass float to NUMERIC
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -66,7 +61,7 @@ def fetch_rows(limit: int):
     """
     params = [bigquery.ScalarQueryParameter("limit", "INT64", limit)]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = bq.query(sql, job_config=job_config)  # location already on client
+    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)  # <-- pass location here
     return list(job.result())
 
 def _build_update_sql(for_fields):
@@ -129,10 +124,10 @@ def update_in_place(row, enriched: dict):
         fields_to_set.append("enrichment_status")
         params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", "NO_DATA"))
 
-    sql = _build_update_sql(set(for_fields := fields_to_set))
-    log.info("APPLY UPDATE for %s -> %s", name, for_fields)
+    sql = _build_update_sql(set(fields_to_set))
+    log.info("APPLY UPDATE for %s -> %s", name, fields_to_set)
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    bq.query(sql, job_config=job_config).result()  # location already on client
+    bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()  # <-- pass location here
 
 def run_batch(limit: int) -> int:
     rows = fetch_rows(limit)
@@ -166,7 +161,7 @@ def run_batch(limit: int) -> int:
 
 @app.get("/healthz")
 def healthz():
-    return "ok", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
 @app.get("/")
 def root():

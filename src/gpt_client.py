@@ -1,5 +1,7 @@
 import json
 import os
+import random
+import time
 from typing import Any, Dict
 
 from openai import OpenAI
@@ -47,6 +49,23 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _retry_call(fn, *, max_retries: int, base: float, cap: float):
+    """
+    Simple exponential backoff with jitter.
+    Retries on any exception; caller controls max_retries.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception:
+            if attempt >= max_retries:
+                raise
+            sleep = min(cap, base * (2 ** attempt)) * (0.5 + random.random())
+            time.sleep(sleep)
+            attempt += 1
+
+
 def enrich_with_gpt(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ask the model to fill: ticket_vendor (str), capacity (int), avg_ticket_price (float).
@@ -54,6 +73,11 @@ def enrich_with_gpt(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     client = _get_client()
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+    max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", "5"))
+    timeout = float(os.environ.get("OPENAI_TIMEOUT", "30"))  # seconds
+    backoff_base = float(os.environ.get("OPENAI_BACKOFF_BASE", "0.5"))
+    backoff_cap = float(os.environ.get("OPENAI_BACKOFF_CAP", "8.0"))
 
     system = (
         "You enrich performing-arts venue/company rows. "
@@ -65,15 +89,18 @@ def enrich_with_gpt(row: Dict[str, Any]) -> Dict[str, Any]:
         "Return STRICT JSON with only known keys.\n\nRow:\n" + json.dumps(row, ensure_ascii=False)
     )
 
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.2,
-    )
+    def _op():
+        return client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            timeout=timeout,
+        )
 
+    resp = _retry_call(_op, max_retries=max_retries, base=backoff_base, cap=backoff_cap)
     content = resp.choices[0].message.content or ""
     data = _extract_json(content)
     out: Dict[str, Any] = {}

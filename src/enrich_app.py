@@ -1,3 +1,4 @@
+cat > src/enrich_app.py <<'PY'
 #!/usr/bin/env python3
 import os
 import logging
@@ -20,13 +21,13 @@ log = logging.getLogger(__name__)
 PROJECT_ID   = os.getenv("PROJECT_ID")
 DATASET_ID   = os.getenv("DATASET_ID", "rfpdata")
 TABLE        = os.getenv("TABLE", "performing_arts_fixed")
-BQ_LOCATION  = os.getenv("BQ_LOCATION", "EU")  # <-- make sure this matches your dataset
+BQ_LOCATION  = os.getenv("BQ_LOCATION", "EU")  # <- set this to match your dataset exactly
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
 
-# Set default location on the client (helps non-query ops) and still pass location= on queries.
+# Helpful default on the client; still pass location= on every query call.
 bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
 app = Flask(__name__)
@@ -44,7 +45,7 @@ def _to_decimal(value):
     if isinstance(value, Decimal):
         return value
     try:
-        return Decimal(str(value))  # never pass float to NUMERIC
+        return Decimal(str(value))  # avoid float -> NUMERIC directly
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -183,3 +184,4 @@ def root():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+PY

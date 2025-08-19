@@ -10,9 +10,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# keep src as a package
 COPY src/ ./src/
 
 EXPOSE 8080
 
-# Use gunicorn in production; allow Cloud Run to set $PORT
+# Production WSGI server
 CMD ["bash", "-lc", "gunicorn -b :${PORT:-8080} src.enrich_app:app"]

@@ -1,78 +1,79 @@
-# src/vendor_patterns.py
 from dataclasses import dataclass
 from typing import List, Dict
+
 
 @dataclass
 class VendorSignature:
     name: str
     domains: List[str]
     script_substrings: List[str]
-    link_keywords: List[str]  # words likely in ticket buttons/paths
+    link_keywords: List[str]  # likely words on purchase buttons/paths
+
 
 VENDOR_SIGNATURES: List[VendorSignature] = [
     VendorSignature(
         name="Ticketmaster",
-        domains=["ticketmaster.", "ticketmaster.fr", "ticketmaster.com"],
+        domains=["ticketmaster.", "ticketmaster.com", "ticketmaster.fr", "ticketmaster.es"],
         script_substrings=["tm.ticketmaster", "ticketmaster.com/widget", "ticketmaster.eu"],
-        link_keywords=["ticketmaster", "buy tickets", "billetterie", "acheter", "tickets"]
+        link_keywords=["ticketmaster", "buy tickets", "billets", "entradas"],
     ),
     VendorSignature(
         name="Eventbrite",
-        domains=["eventbrite.", "eventbrite.fr", "eventbrite.com"],
-        script_substrings=["eventbrite-widget", "eventbrite.com/static/widgets"],
-        link_keywords=["eventbrite", "tickets", "register"]
+        domains=["eventbrite.", "eventbrite.com", "eventbrite.fr", "eventbrite.es"],
+        script_substrings=["eventbrite.com/static/", "evb/ui/"],
+        link_keywords=["eventbrite", "get tickets", "register"],
     ),
     VendorSignature(
         name="Weezevent",
-        domains=["weezevent.", "weezevent.com", "weezevent.fr"],
-        script_substrings=["weezevent.com/js/"],
-        link_keywords=["weezevent", "billetterie", "acheter", "reserver"]
+        domains=["weezevent.", "weezevent.com", "weezevent.com/fr/"],
+        script_substrings=["weezpay", "widget.weezevent"],
+        link_keywords=["weezevent", "billetterie"],
     ),
     VendorSignature(
         name="Billetweb",
-        domains=["billetweb.", "billetweb.fr", "billetweb.net"],
-        script_substrings=["billetweb.fr/widget", "billetweb.net/widget"],
-        link_keywords=["billetweb", "billetterie", "reserver"]
+        domains=["billetweb.", "billetweb.fr"],
+        script_substrings=["billetweb.fr/js", "widgets.billetweb"],
+        link_keywords=["billetweb", "billetterie"],
+    ),
+    VendorSignature(
+        name="See Tickets",
+        domains=["seetickets.", "seetickets.com", "seetickets.fr"],
+        script_substrings=["seetickets.com/tour", "widgets.seetickets"],
+        link_keywords=["see tickets", "tickets"],
+    ),
+    VendorSignature(
+        name="Dice",
+        domains=["dice.fm", "dice.", "link.dice.fm"],
+        script_substrings=["dice.fm/embed", "widgets.dice"],
+        link_keywords=["dice", "tickets"],
+    ),
+    VendorSignature(
+        name="AXS",
+        domains=["axs.com", "shop.axs.com", "axs."],
+        script_substrings=["axs.com/axs-widget"],
+        link_keywords=["axs", "tickets"],
+    ),
+    VendorSignature(
+        name="Eventim",
+        domains=["eventim.", "eventim.de", "eventim.fr", "eventim.es", "eventim.co.uk"],
+        script_substrings=["eventim", "etix"],
+        link_keywords=["eventim", "tickets"],
     ),
     VendorSignature(
         name="Digitick",
         domains=["digitick.", "digitick.com"],
         script_substrings=["digitick.com/widget"],
-        link_keywords=["digitick", "billetterie"]
-    ),
-    VendorSignature(
-        name="See Tickets",
-        domains=["seetickets.", "seetickets.com", "seetickets.fr"],
-        script_substrings=["seetickets.com/script", "shop.seetickets"],
-        link_keywords=["see tickets", "seetickets", "tickets"]
-    ),
-    VendorSignature(
-        name="Dice",
-        domains=["dice.fm"],
-        script_substrings=["dice.fm/embed", "widgets.dice.fm"],
-        link_keywords=["dice", "tickets"]
-    ),
-    VendorSignature(
-        name="AXS",
-        domains=["axs.com"],
-        script_substrings=["axs.com/embedded"],
-        link_keywords=["axs", "tickets"]
-    ),
-    VendorSignature(
-        name="Eventim",
-        domains=["eventim.", "eventim.fr", "eventim.de", "eventim.com"],
-        script_substrings=["eventim.", "eventim.com/widgets"],
-        link_keywords=["eventim", "tickets"]
+        link_keywords=["digitick", "billetterie"],
     ),
     VendorSignature(
         name="Shotgun",
-        domains=["shotgun.live"],
-        script_substrings=["shotgun.live/widget"],
-        link_keywords=["shotgun", "tickets"]
+        domains=["shotgun.live", "shotgun.", "shotgun.xxx"],
+        script_substrings=["shotgun.live/widget", "shotgun.live/embed"],
+        link_keywords=["shotgun", "tickets"],
     ),
 ]
 
-# vendor priority if multiple are found (purchase-path first, then this order)
+# Preference order when multiple are detected
 VENDOR_PRIORITY: Dict[str, int] = {
     "Ticketmaster": 10,
     "Eventbrite": 9,

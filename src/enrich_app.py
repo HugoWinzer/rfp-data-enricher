@@ -13,10 +13,6 @@ from openai import OpenAI
 
 from .gpt_client import enrich_with_gpt
 
-# ------------------------------------------------------------------------------
-# Config & globals
-# ------------------------------------------------------------------------------
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -26,25 +22,22 @@ TABLE = os.environ.get("TABLE", "performing_arts_fixed")
 TABLE_FQN = f"{PROJECT_ID}.{DATASET_ID}.{TABLE}"
 
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-BQ_LOCATION = os.environ.get("BQ_LOCATION")  # e.g. "europe-southwest1"
+BQ_LOCATION = os.environ.get("BQ_LOCATION")  # e.g. europe-southwest1
 
 ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "0"))
 ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "0"))
 
 bq = bigquery.Client(project=PROJECT_ID)
-oa = OpenAI(  # not used directly here, but triggers early key validation if missing
+oa = OpenAI(
     max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "5")),
     timeout=float(os.getenv("OPENAI_TIMEOUT", "30")),
 )
 
 app = Flask(__name__)
 
-# Convenience kwargs for every BigQuery call
+# Pass this to every bq.query(...) call (the *only* supported way)
 _BQ_KW = {"location": BQ_LOCATION} if BQ_LOCATION else {}
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
 
 def _to_decimal(val: Any):
     if val is None or val == "":
@@ -56,7 +49,6 @@ def _to_decimal(val: Any):
 
 
 def gpt_enrich(row: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Run GPT and return (enriched_fields, source_fields)."""
     try:
         enriched = enrich_with_gpt(row, OPENAI_MODEL)
     except Exception as e:
@@ -90,6 +82,7 @@ def fetch_rows(limit: int):
     """
     params = [bigquery.ScalarQueryParameter("limit", "INT64", int(limit))]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
+    # NOTE: do NOT set job_config.location; pass location via bq.query(...)
     return list(bq.query(sql, job_config=job_config, **_BQ_KW).result())
 
 
@@ -97,55 +90,48 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any], sources: Dict
     sets = ["last_updated = CURRENT_TIMESTAMP()"]
     params = []
 
-    # ticket_vendor
     if enriched.get("ticket_vendor") is not None:
         sets.append("ticket_vendor = @ticket_vendor")
         params.append(bigquery.ScalarQueryParameter("ticket_vendor", "STRING", enriched["ticket_vendor"]))
-        src = sources.get("ticket_vendor_source")
-        if src:
+        if sources.get("ticket_vendor_source"):
             sets.append("ticket_vendor_source = @ticket_vendor_source")
-            params.append(bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", src))
+            params.append(bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", sources["ticket_vendor_source"]))
 
-    # capacity
     if enriched.get("capacity") is not None:
         sets.append("capacity = @capacity")
         params.append(bigquery.ScalarQueryParameter("capacity", "INT64", int(enriched["capacity"])))
-        src = sources.get("capacity_source")
-        if src:
+        if sources.get("capacity_source"):
             sets.append("capacity_source = @capacity_source")
-            params.append(bigquery.ScalarQueryParameter("capacity_source", "STRING", src))
+            params.append(bigquery.ScalarQueryParameter("capacity_source", "STRING", sources["capacity_source"]))
 
-    # avg_ticket_price (NUMERIC-safe)
+    # NUMERIC-safe price
     if "avg_ticket_price" in enriched:
         price_dec = _to_decimal(enriched.get("avg_ticket_price"))
         if price_dec is not None:
             sets.append("avg_ticket_price = CAST(@avg_ticket_price AS NUMERIC)")
             params.append(bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", price_dec))
-            src = sources.get("avg_ticket_price_source")
-            if src:
+            if sources.get("avg_ticket_price_source"):
                 sets.append("avg_ticket_price_source = @avg_ticket_price_source")
-                params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", src))
+                params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", sources["avg_ticket_price_source"]))
         else:
-            log.info("Skip avg_ticket_price update: not a valid Decimal for row key candidate")
+            log.info("Skip avg_ticket_price update: invalid Decimal")
 
-    # enrichment_status
     if enriched.get("enrichment_status") is not None:
         sets.append("enrichment_status = @enrichment_status")
         params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", enriched["enrichment_status"]))
 
     if len(sets) == 1:
-        # Nothing to update → preserve/mark status
         sets.append("enrichment_status = COALESCE(@enrichment_status, enrichment_status)")
         params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", enriched.get("enrichment_status", "NO_DATA")))
 
-    # Identify row
+    # Row identifier (name or id)
     where_col = "name"
-    key_val = row.get(where_col) if isinstance(row, dict) else getattr(row, where_col, None)
+    key_val = row.get("name") if isinstance(row, dict) else getattr(row, "name", None)
     if key_val is None:
         where_col = "id"
-        key_val = row.get(where_col) if isinstance(row, dict) else getattr(row, where_col, None)
+        key_val = row.get("id") if isinstance(row, dict) else getattr(row, "id", None)
     if key_val is None:
-        raise RuntimeError("Cannot identify row key: expected 'name' or 'id' in table.")
+        raise RuntimeError("Cannot identify row key: expected 'name' or 'id'.")
 
     params.append(bigquery.ScalarQueryParameter("key", "STRING", str(key_val)))
 
@@ -154,7 +140,6 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any], sources: Dict
     SET {", ".join(sets)}
     WHERE {where_col} = @key
     """
-
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     bq.query(q, job_config=job_config, **_BQ_KW).result()
 
@@ -179,19 +164,16 @@ def run_batch(limit: int) -> int:
             log.error("Failed row: %s: %s", key, e)
 
         if ROW_DELAY_MAX_MS > 0:
-            # Avoid hammering upstream APIs (why: 429s)
             jitter_ms = random.randint(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS)
             time.sleep(jitter_ms / 1000.0)
 
     return processed
 
-# ------------------------------------------------------------------------------
-# Routes
-# ------------------------------------------------------------------------------
 
 @app.get("/healthz")
 def healthz():
     return "ok", 200
+
 
 @app.get("/")
 def root():
@@ -207,6 +189,7 @@ def root():
     except Exception as e:
         log.exception("Batch failed")
         return jsonify({"processed": 0, "status": "ERROR", "error": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))

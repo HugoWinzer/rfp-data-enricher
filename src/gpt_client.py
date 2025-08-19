@@ -3,72 +3,43 @@ from typing import Dict, Any, Optional
 from openai import OpenAI
 
 log = logging.getLogger("enricher")
-
-# Allow override via env; default to cost-efficient general model
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+_client = OpenAI()
 
-_client = OpenAI()  # uses OPENAI_API_KEY from env
-
-
-def _coerce_int(x) -> Optional[int]:
+def _to_int(x) -> Optional[int]:
     try:
-        if x is None or x == "":
-            return None
-        # strings like "1,200" or "1200 seats"
+        if x is None or x == "": return None
         if isinstance(x, str):
-            digits = "".join(ch for ch in x if ch.isdigit())
-            if not digits:
-                return None
-            x = int(digits)
+            s = "".join(ch for ch in x if ch.isdigit())
+            if not s: return None
+            x = int(s)
         return int(x)
     except Exception:
         return None
 
-
-def _coerce_float(x) -> Optional[float]:
+def _to_float(x) -> Optional[float]:
     try:
-        if x is None or x == "":
-            return None
+        if x is None or x == "": return None
         if isinstance(x, str):
-            # keep digits and dot/comma, normalize comma to dot
-            s = "".join(ch for ch in x if (ch.isdigit() or ch in ".,"))
-            s = s.replace(",", ".")
-            if s.count(".") > 1 or not s:
-                return None
+            s = "".join(ch for ch in x if ch.isdigit() or ch in ".,").replace(",", ".")
+            if not s or s.count(".") > 1: return None
             x = float(s)
         return float(x)
     except Exception:
         return None
 
-
 def enrich_with_gpt(raw: Dict[str, Any], web_context: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Ask GPT to fill any of: ticket_vendor (string), capacity (int), avg_ticket_price (float).
-    Must return null for unknown. No hallucinated URLs or currency conversions.
-    """
     name = (raw.get("name") or "").strip()
     domain = (raw.get("domain") or "").strip()
     city = (raw.get("city") or "").strip()
     country = (raw.get("country") or "").strip()
+    ctx = (web_context or "").strip()[:8000]
 
-    system_prompt = (
-        "You are a careful data enricher for a performing-arts venues table.\n"
-        "- Only answer fields you can infer with high confidence.\n"
-        "- If unknown, output null.\n"
-        "- Fields:\n"
-        "  ticket_vendor: string, e.g. Ticketmaster, Eventbrite, Universe, Billetto, or null if unclear.\n"
-        "  capacity: integer seat capacity for the venue (not an event), or null.\n"
-        "  avg_ticket_price: typical single-ticket price (local currency numeric), or null.\n"
-        "- Do NOT invent facts. Prefer hints in provided website text if present."
+    system = (
+        "You enrich venue data. Fill fields only if highly confident; else null.\n"
+        "Fields: ticket_vendor (string|null), capacity (int|null), avg_ticket_price (number|null)."
     )
-
-    # Trim long website dumps so we stay within token limits
-    context = (web_context or "").strip()
-    if len(context) > 8000:
-        context = context[:8000]
-
-    # Strict JSON schema so we get machine-safe output
-    json_schema = {
+    schema = {
         "name": "venue_enrichment",
         "strict": True,
         "schema": {
@@ -82,49 +53,31 @@ def enrich_with_gpt(raw: Dict[str, Any], web_context: Optional[str] = None) -> D
             "additionalProperties": False,
         },
     }
-
-    # Build a compact, deterministic input
-    user_payload = (
-        f"Record:\n"
-        f"- name: {name}\n"
-        f"- domain: {domain}\n"
-        f"- city: {city}\n"
-        f"- country: {country}\n\n"
-        f"Website text (may be empty):\n{context}"
+    user = (
+        f"Record:\n- name: {name}\n- domain: {domain}\n- city: {city}\n- country: {country}\n\n"
+        f"Website text:\n{ctx}"
     )
 
     try:
-        resp = _client.responses.create(
+        r = _client.responses.create(
             model=OPENAI_MODEL,
-            response_format={"type": "json_schema", "json_schema": json_schema},
+            response_format={"type": "json_schema", "json_schema": schema},
             input=[
-                {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-                {"role": "user", "content": [{"type": "text", "text": user_payload}]},
+                {"role": "system", "content": [{"type":"text","text": system}]},
+                {"role": "user",   "content": [{"type":"text","text": user}]},
             ],
             max_output_tokens=300,
         )
-        raw_json = resp.output_text  # responses API convenience property
-        data = json.loads(raw_json) if raw_json else {}
+        data = json.loads(r.output_text or "{}")
     except Exception as e:
-        log.warning("GPT call failed for '%s': %s", name, e)
+        log.warning("GPT fail for '%s': %s", name, e)
         return {}
 
-    # Coerce types and sanitize
     out: Dict[str, Any] = {}
-
-    tv = data.get("ticket_vendor")
-    if isinstance(tv, str):
-        tv = tv.strip()
-    if tv:
-        # keep it short & tidy
-        out["ticket_vendor"] = tv[:64]
-
-    cap = _coerce_int(data.get("capacity"))
-    if cap and cap > 0:
-        out["capacity"] = cap
-
-    price = _coerce_float(data.get("avg_ticket_price"))
-    if price and price > 0:
-        out["avg_ticket_price"] = round(float(price), 2)
-
+    tv = (data.get("ticket_vendor") or "").strip()
+    if tv: out["ticket_vendor"] = tv[:64]
+    cap = _to_int(data.get("capacity"))
+    if cap and cap > 0: out["capacity"] = cap
+    price = _to_float(data.get("avg_ticket_price"))
+    if price and price > 0: out["avg_ticket_price"] = round(price, 2)
     return out

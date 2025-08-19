@@ -1,4 +1,3 @@
-# Dockerfile
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -10,10 +9,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# keep src as a package
 COPY src/ ./src/
 
 EXPOSE 8080
 
-# Production WSGI server
-CMD ["bash", "-lc", "gunicorn -b :${PORT:-8080} src.enrich_app:app"]
+# Always start gunicorn; importable app is src.enrich_app:app
+ENTRYPOINT ["gunicorn"]
+CMD ["-b", ":8080", "src.enrich_app:app"]

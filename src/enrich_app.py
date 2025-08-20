@@ -175,11 +175,10 @@ def run_batch(limit: int) -> int:
 # Routes
 # ------------------------------------------------------------------------------
 
-@app.get("/ping")
-def ping():
-    return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
-
-@app.get("/healthz")
+@app.route("/healthz", methods=["GET", "HEAD"])
+@app.route("/healthz/", methods=["GET", "HEAD"])   # trailing slash variant
+@app.route("/_ah/health", methods=["GET", "HEAD"]) # GCP health path
+@app.route("/ping", methods=["GET", "HEAD"])       # extra-friendly ping
 def healthz():
     return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
@@ -203,3 +202,4 @@ def root():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+

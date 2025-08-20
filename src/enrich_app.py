@@ -20,7 +20,8 @@ log = logging.getLogger(__name__)
 PROJECT_ID   = os.getenv("PROJECT_ID")
 DATASET_ID   = os.getenv("DATASET_ID", "rfpdata")
 TABLE        = os.getenv("TABLE", "performing_arts_fixed")
-BQ_LOCATION  = os.getenv("BQ_LOCATION")  # REQUIRED: exact dataset location (e.g. EU or europe-southwest1)
+# REQUIRED: set to your dataset's region or multi-region (e.g. "EU" or "europe-southwest1")
+BQ_LOCATION  = os.getenv("BQ_LOCATION")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not PROJECT_ID:
@@ -45,9 +46,20 @@ def _to_decimal(value):
     if isinstance(value, Decimal):
         return value
     try:
-        return Decimal(str(value))  # Avoid passing float directly to NUMERIC
+        # Avoid passing float directly to NUMERIC
+        return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
+
+def _row_to_dict(row):
+    # BigQuery Row supports .items(); dict(row) is not guaranteed
+    try:
+        return dict(row.items())
+    except Exception:
+        try:
+            return dict(row)
+        except Exception:
+            return {}
 
 def fetch_rows(limit: int):
     """Fetch candidate rows to enrich."""
@@ -129,6 +141,7 @@ def update_in_place(row, enriched: dict):
     sql = _build_update_sql(set(fields_to_set))
     log.info("APPLY UPDATE for %s -> %s", name, fields_to_set)
     job_config = bigquery.QueryJobConfig(query_parameters=params)
+    # IMPORTANT: pass location here too
     bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()
 
 def run_batch(limit: int) -> int:
@@ -140,9 +153,10 @@ def run_batch(limit: int) -> int:
         except Exception:
             name = r.get("organization_name") if isinstance(r, dict) else None
 
+        row_dict = _row_to_dict(r)
         enriched = {"enrichment_status": "NO_DATA"}
         try:
-            suggestion = enrich_with_gpt(name=name, row=dict(r), model=OPENAI_MODEL)
+            suggestion = enrich_with_gpt(name=name, row=row_dict, model=OPENAI_MODEL)
             if suggestion:
                 enriched.update({k: v for k, v in suggestion.items() if v not in (None, "", {})})
                 if any(enriched.get(k) for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
@@ -160,6 +174,10 @@ def run_batch(limit: int) -> int:
 # ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
+
+@app.get("/ping")
+def ping():
+    return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
 @app.get("/healthz")
 def healthz():

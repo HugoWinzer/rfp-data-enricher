@@ -14,7 +14,6 @@ HDRS = {"User-Agent": "Mozilla/5.0 (compatible; rfp-enricher/1.0; +https://examp
 
 
 def normalize_name(name: str) -> str:
-    """ASCII, lowercase, collapse spaces – helps fuzzy compares."""
     s = unidecode(name or "")
     s = s.lower()
     s = re.sub(r"[’'`´]", " ", s)
@@ -42,24 +41,18 @@ def fetch_html(url: str) -> str:
 
 
 def sniff_vendor_signals(html: str, base_url: Optional[str]) -> List[Dict[str, str]]:
-    """
-    Return list of {'vendor','evidence','type'} from script/src and anchor/href.
-    Why: vendor widgets/links are the most reliable non-API signal.
-    """
     signals: List[Dict[str, str]] = []
     if not html:
         return signals
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # scripts
     for s in soup.find_all("script", src=True):
         src = s.get("src", "")
         for sig in VENDOR_SIGNATURES:
             if any(x in src for x in sig.script_substrings):
                 signals.append({"vendor": sig.name, "evidence": absolute_link(src, base_url), "type": "script"})
 
-    # anchors
     for a in soup.find_all("a", href=True):
         href = a["href"]
         text = (a.get_text() or "").lower().strip()
@@ -68,7 +61,6 @@ def sniff_vendor_signals(html: str, base_url: Optional[str]) -> List[Dict[str, s
             if any(d in href_l for d in sig.domains) or any(k in text for k in sig.link_keywords):
                 signals.append({"vendor": sig.name, "evidence": absolute_link(href, base_url), "type": "link"})
 
-    # unique
     seen = set()
     uniq = []
     for s in signals:
@@ -96,7 +88,6 @@ PRICE_RE = re.compile(r"(?:€|eur|euro|£|gbp|usd|\$)?\s*(\d{1,3})(?:[,.](\d{2}
 
 
 def parse_prices(text: str) -> List[int]:
-    """Return plausible whole-number prices [3..800] to dampen noisy text."""
     if not text:
         return []
     prices: List[int] = []
@@ -111,7 +102,6 @@ def parse_prices(text: str) -> List[int]:
 
 
 def scrape_website_text(domain: Optional[str]) -> Tuple[str, str]:
-    """Return (html, text) for a given site; empty strings on failure."""
     if not domain:
         return "", ""
     url = domain

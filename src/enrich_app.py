@@ -4,20 +4,20 @@ import time
 import random
 import logging
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
 try:
-    from .gpt_client import enrich_with_gpt  # package import (gunicorn)
+    from .gpt_client import enrich_with_gpt
     from .extractors import (
         scrape_website_text,
         sniff_vendor_signals,
         choose_vendor,
         derive_price_from_text,
     )
-except Exception:  # local direct run
+except Exception:
     from gpt_client import enrich_with_gpt
     from extractors import (
         scrape_website_text,
@@ -25,10 +25,6 @@ except Exception:  # local direct run
         choose_vendor,
         derive_price_from_text,
     )
-
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -48,13 +44,8 @@ if not BQ_LOCATION:
     raise RuntimeError("BQ_LOCATION env var is required (e.g. 'EU' or 'europe-west1')")
 
 bq = bigquery.Client(project=PROJECT_ID)
-
 app = Flask(__name__)
-app.url_map.strict_slashes = False  # accept both with/without trailing slash
-
-# ----------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------
+app.url_map.strict_slashes = False
 
 
 def table_fqdn() -> str:
@@ -67,7 +58,7 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
     if isinstance(value, Decimal):
         return value
     try:
-        return Decimal(str(value))  # avoid float -> NUMERIC issues
+        return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
 
@@ -83,10 +74,6 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
 
 
 def fetch_rows(limit: int):
-    """
-    Pull candidates missing any of the target fields.
-    Why: older rows first reduces reprocessing churn.
-    """
     sql = f"""
     SELECT *
     FROM {table_fqdn()}
@@ -130,9 +117,8 @@ def _build_update_sql(for_fields: List[str], use_id: bool) -> str:
 
 
 def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
-    """Parameterised UPDATE with optional *_source fields."""
     name = row.get("name") or row.get("organization_name")
-    row_id = row.get("id")  # if your table has a stable id, we prefer it
+    row_id = row.get("id")
 
     fields_to_set: List[str] = []
     params: List[bigquery.ScalarQueryParameter] = []
@@ -141,7 +127,6 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
     else:
         params.append(bigquery.ScalarQueryParameter("name", "STRING", name))
 
-    # vendor
     tv = enriched.get("ticket_vendor")
     if tv:
         fields_to_set.append("ticket_vendor")
@@ -151,7 +136,6 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
             fields_to_set.append("ticket_vendor_source")
             params.append(bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", src))
 
-    # capacity
     cap = enriched.get("capacity")
     if cap is not None:
         try:
@@ -165,7 +149,6 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
         except Exception:
             pass
 
-    # price
     price = enriched.get("avg_ticket_price")
     if price is not None:
         dec = _to_decimal(price)
@@ -177,7 +160,6 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
                 fields_to_set.append("avg_ticket_price_source")
                 params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", src))
 
-    # status
     status = enriched.get("enrichment_status", "OK")
     fields_to_set.append("enrichment_status")
     params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", status))
@@ -189,31 +171,23 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
 
 
 def _combine_enrichment(row: Dict[str, Any], gpt_suggestion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Blend scrape-derived vendor/price with GPT suggestion.
-    Why: scraping is more deterministic for vendor; GPT is better for capacity.
-    """
     website = row.get("website") or row.get("url")
     html, text = scrape_website_text(website)
 
     derived: Dict[str, Any] = {"enrichment_status": "NO_DATA"}
 
-    # vendor from page signals
     signals = sniff_vendor_signals(html, website)
     vendor = choose_vendor(signals)
     if vendor:
         derived["ticket_vendor"] = vendor
         derived["ticket_vendor_source"] = "SCRAPE"
 
-    # price heuristic
     avg_price = derive_price_from_text(text)
     if avg_price is not None:
         derived["avg_ticket_price"] = avg_price
         derived["avg_ticket_price_source"] = "SCRAPE"
 
-    # merge GPT
     if gpt_suggestion:
-        # Prefer scraping for vendor/price; GPT fills capacity and any gaps.
         if "capacity" in gpt_suggestion and gpt_suggestion["capacity"] is not None:
             derived["capacity"] = gpt_suggestion["capacity"]
             derived["capacity_source"] = "GPT"
@@ -235,31 +209,23 @@ def run_batch(limit: int) -> int:
     processed = 0
     for r in rows:
         row_dict = _row_to_dict(r)
-        try:
-            name = row_dict.get("name") or row_dict.get("organization_name")
-        except Exception:
-            name = None
-
+        name = row_dict.get("name") or row_dict.get("organization_name")
         try:
             suggestion = enrich_with_gpt(name=name or "", row=row_dict, model=OPENAI_MODEL)
         except Exception as e:
-            log.warning("gpt failed: %s", e)
+            logging.warning("gpt failed: %s", e)
             suggestion = None
 
         enriched = _combine_enrichment(row_dict, suggestion)
 
         try:
             update_in_place(row_dict, enriched)
-            time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
+            time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)  # why: ease BQ DML pressure
             processed += 1
         except Exception as e:
             log.error("Failed row: %s: %s", name, e, exc_info=True)
     return processed
 
-
-# ----------------------------------------------------------------------
-# Routes
-# ----------------------------------------------------------------------
 
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():

@@ -71,6 +71,19 @@ VENDOR_SIGNATURES: List[VendorSignature] = [
         script_substrings=["shotgun.live/widget", "shotgun.live/embed"],
         link_keywords=["shotgun", "tickets"],
     ),
+    # Added
+    VendorSignature(
+        name="Fever",
+        domains=["feverup.com", "feverup."],
+        script_substrings=["feverup.com/widget", "feverup.com/embeds"],
+        link_keywords=["fever", "book now"],
+    ),
+    VendorSignature(
+        name="Universe",
+        domains=["universe.com", "universetickets."],
+        script_substrings=["universe.com/embed"],
+        link_keywords=["universe", "tickets"],
+    ),
 ]
 
 # Preference order when multiple are detected
@@ -85,4 +98,6 @@ VENDOR_PRIORITY: Dict[str, int] = {
     "Eventim": 6,
     "Digitick": 5,
     "Shotgun": 5,
+    "Fever": 5,
+    "Universe": 4,
 }

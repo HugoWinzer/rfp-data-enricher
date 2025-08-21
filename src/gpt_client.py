@@ -8,7 +8,6 @@ _client: Optional[OpenAI] = None
 
 
 def _client_or_none() -> Optional[OpenAI]:
-    """Avoid crashing if OPENAI_API_KEY is not set."""
     global _client
     if _client is not None:
         return _client
@@ -29,10 +28,6 @@ SYS = (
 
 
 def enrich_with_gpt(*, name: str, row: Dict[str, Any], model: str = "gpt-4o-mini") -> Optional[Dict[str, Any]]:
-    """
-    Ask GPT for structured hints. Safe to call with missing API key – returns None.
-    Why: GPT is useful for capacity and as a backfill when scraping fails.
-    """
     client = _client_or_none()
     if client is None:
         return None
@@ -57,7 +52,6 @@ def enrich_with_gpt(*, name: str, row: Dict[str, Any], model: str = "gpt-4o-mini
         )
         text = resp.choices[0].message.content.strip()
     except Exception:
-        # Fallback (future-proof)
         resp = client.responses.create(
             model=model,
             input=msg,

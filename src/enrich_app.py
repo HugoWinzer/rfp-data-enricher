@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
 TABLE = os.getenv("TABLE", "performing_arts_fixed")
-BQ_LOCATION = os.getenv("BQ_LOCATION")  # e.g. "EU" or "europe-west1"
+BQ_LOCATION = os.getenv("BQ_LOCATION")  # e.g. "US", "EU", "europe-southwest1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
@@ -41,7 +41,7 @@ ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
 if not BQ_LOCATION:
-    raise RuntimeError("BQ_LOCATION env var is required (e.g. 'EU' or 'europe-west1')")
+    raise RuntimeError("BQ_LOCATION env var is required (e.g. 'US'/'EU'/'region')")
 
 bq = bigquery.Client(project=PROJECT_ID)
 app = Flask(__name__)
@@ -52,11 +52,9 @@ def table_fqdn() -> str:
     return f"`{PROJECT_ID}.{DATASET_ID}.{TABLE}`"
 
 
-def _to_decimal(value: Any) -> Optional[Decimal]:
+def _to_decimal(value: Any):
     if value is None:
         return None
-    if isinstance(value, Decimal):
-        return value
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
@@ -171,12 +169,13 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
 
 
 def _combine_enrichment(row: Dict[str, Any], gpt_suggestion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    website = row.get("website") or row.get("url")
-    html, text = scrape_website_text(website)
+    # Use 'domain' if available
+    site = row.get("domain") or row.get("website") or row.get("url")
+    html, text = scrape_website_text(site)
 
     derived: Dict[str, Any] = {"enrichment_status": "NO_DATA"}
 
-    signals = sniff_vendor_signals(html, website)
+    signals = sniff_vendor_signals(html, site)
     vendor = choose_vendor(signals)
     if vendor:
         derived["ticket_vendor"] = vendor
@@ -220,7 +219,7 @@ def run_batch(limit: int) -> int:
 
         try:
             update_in_place(row_dict, enriched)
-            time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)  # why: ease BQ DML pressure
+            time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)  # reduce BQ DML pressure
             processed += 1
         except Exception as e:
             log.error("Failed row: %s: %s", name, e, exc_info=True)

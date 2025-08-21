@@ -1,30 +1,46 @@
 #!/usr/bin/env python3
 import os
 import time
+import random
 import logging
 from decimal import Decimal, InvalidOperation
+from typing import Dict, Any, Optional, List, Tuple
+
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
 try:
     from .gpt_client import enrich_with_gpt  # package import (gunicorn)
-except Exception:
-    from gpt_client import enrich_with_gpt    # direct run
+    from .extractors import (
+        scrape_website_text,
+        sniff_vendor_signals,
+        choose_vendor,
+        derive_price_from_text,
+    )
+except Exception:  # local direct run
+    from gpt_client import enrich_with_gpt
+    from extractors import (
+        scrape_website_text,
+        sniff_vendor_signals,
+        choose_vendor,
+        derive_price_from_text,
+    )
 
-
-# ------------------------------------------------------------------------------
-# Config & globals
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-PROJECT_ID   = os.getenv("PROJECT_ID")
-DATASET_ID   = os.getenv("DATASET_ID", "rfpdata")
-TABLE        = os.getenv("TABLE", "performing_arts_fixed")
-# REQUIRED: exact dataset location, e.g. "EU" or "europe-west1"
-BQ_LOCATION  = os.getenv("BQ_LOCATION")
+PROJECT_ID = os.getenv("PROJECT_ID")
+DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
+TABLE = os.getenv("TABLE", "performing_arts_fixed")
+BQ_LOCATION = os.getenv("BQ_LOCATION")  # e.g. "EU" or "europe-west1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
+ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
 
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
@@ -34,28 +50,29 @@ if not BQ_LOCATION:
 bq = bigquery.Client(project=PROJECT_ID)
 
 app = Flask(__name__)
-# Accept both with/without trailing slashes for *all* routes
-app.url_map.strict_slashes = False
+app.url_map.strict_slashes = False  # accept both with/without trailing slash
 
-
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+
 
 def table_fqdn() -> str:
     return f"`{PROJECT_ID}.{DATASET_ID}.{TABLE}`"
 
-def _to_decimal(value):
+
+def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
     if isinstance(value, Decimal):
         return value
     try:
-        return Decimal(str(value))  # avoid passing float directly to NUMERIC
+        return Decimal(str(value))  # avoid float -> NUMERIC issues
     except (InvalidOperation, ValueError, TypeError):
         return None
 
-def _row_to_dict(row):
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
     try:
         return dict(row.items())
     except Exception:
@@ -64,53 +81,75 @@ def _row_to_dict(row):
         except Exception:
             return {}
 
+
 def fetch_rows(limit: int):
-    """Fetch candidate rows to enrich."""
+    """
+    Pull candidates missing any of the target fields.
+    Why: older rows first reduces reprocessing churn.
+    """
     sql = f"""
     SELECT *
     FROM {table_fqdn()}
     WHERE
       (avg_ticket_price IS NULL OR capacity IS NULL OR ticket_vendor IS NULL)
-      AND (enrichment_status IS NULL OR enrichment_status NOT IN ("LOCKED"))
+      AND (enrichment_status IS NULL OR enrichment_status NOT IN ('LOCKED'))
     ORDER BY COALESCE(last_updated, TIMESTAMP('1970-01-01')) ASC
     LIMIT @limit
     """
     params = [bigquery.ScalarQueryParameter("limit", "INT64", limit)]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    # IMPORTANT: pass location on the query call; do NOT set job_config.location
     job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)
     return list(job.result())
 
-def _build_update_sql(for_fields):
+
+def _build_update_sql(for_fields: List[str], use_id: bool) -> str:
     sets = []
     if "ticket_vendor" in for_fields:
-        sets.append("ticket_vendor = @ticket_vendor, ticket_vendor_source = 'GPT'")
+        sets.append("ticket_vendor = @ticket_vendor")
     if "capacity" in for_fields:
-        sets.append("capacity = @capacity, capacity_source = 'GPT'")
+        sets.append("capacity = @capacity")
     if "avg_ticket_price" in for_fields:
-        sets.append("avg_ticket_price = @avg_ticket_price, avg_ticket_price_source = 'GPT'")
+        sets.append("avg_ticket_price = @avg_ticket_price")
     if "enrichment_status" in for_fields:
         sets.append("enrichment_status = @enrichment_status")
+    if "ticket_vendor_source" in for_fields:
+        sets.append("ticket_vendor_source = @ticket_vendor_source")
+    if "capacity_source" in for_fields:
+        sets.append("capacity_source = @capacity_source")
+    if "avg_ticket_price_source" in for_fields:
+        sets.append("avg_ticket_price_source = @avg_ticket_price_source")
+
     sets.append("last_updated = CURRENT_TIMESTAMP()")
-    set_clause = ", ".join(sets)
+    where_clause = "id = @id" if use_id else "name = @name"
     sql = f"""
     UPDATE {table_fqdn()}
-    SET {set_clause}
-    WHERE name = @name
+    SET {", ".join(sets)}
+    WHERE {where_clause}
     """
     return sql
 
-def update_in_place(row, enriched: dict):
-    """Update one row with enriched values using parameterized query."""
-    name = row.get("name") if isinstance(row, dict) else row["name"]
-    fields_to_set = []
-    params = [bigquery.ScalarQueryParameter("name", "STRING", name)]
 
-    # ticket vendor
+def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
+    """Parameterised UPDATE with optional *_source fields."""
+    name = row.get("name") or row.get("organization_name")
+    row_id = row.get("id")  # if your table has a stable id, we prefer it
+
+    fields_to_set: List[str] = []
+    params: List[bigquery.ScalarQueryParameter] = []
+    if row_id is not None:
+        params.append(bigquery.ScalarQueryParameter("id", "INT64", int(row_id)))
+    else:
+        params.append(bigquery.ScalarQueryParameter("name", "STRING", name))
+
+    # vendor
     tv = enriched.get("ticket_vendor")
     if tv:
         fields_to_set.append("ticket_vendor")
         params.append(bigquery.ScalarQueryParameter("ticket_vendor", "STRING", tv))
+        src = enriched.get("ticket_vendor_source")
+        if src:
+            fields_to_set.append("ticket_vendor_source")
+            params.append(bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", src))
 
     # capacity
     cap = enriched.get("capacity")
@@ -119,94 +158,132 @@ def update_in_place(row, enriched: dict):
             cap_int = int(cap)
             fields_to_set.append("capacity")
             params.append(bigquery.ScalarQueryParameter("capacity", "INT64", cap_int))
+            src = enriched.get("capacity_source")
+            if src:
+                fields_to_set.append("capacity_source")
+                params.append(bigquery.ScalarQueryParameter("capacity_source", "STRING", src))
         except Exception:
             pass
 
-    # avg ticket price (NUMERIC)
+    # price
     price = enriched.get("avg_ticket_price")
     if price is not None:
         dec = _to_decimal(price)
         if dec is not None:
             fields_to_set.append("avg_ticket_price")
             params.append(bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", dec))
+            src = enriched.get("avg_ticket_price_source")
+            if src:
+                fields_to_set.append("avg_ticket_price_source")
+                params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", src))
 
-    # enrichment_status
+    # status
     status = enriched.get("enrichment_status", "OK")
     fields_to_set.append("enrichment_status")
     params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", status))
 
-    if not fields_to_set:
-        # still mark last_updated + status
-        fields_to_set.append("enrichment_status")
-        params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", "NO_DATA"))
-
-    sql = _build_update_sql(set(fields_to_set))
-    log.info("APPLY UPDATE for %s -> %s", name, fields_to_set)
+    sql = _build_update_sql(fields_to_set, use_id=row_id is not None)
+    log.info("APPLY UPDATE for %s -> %s", row_id or name, sorted(fields_to_set))
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    # IMPORTANT: pass location here too
     bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()
+
+
+def _combine_enrichment(row: Dict[str, Any], gpt_suggestion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Blend scrape-derived vendor/price with GPT suggestion.
+    Why: scraping is more deterministic for vendor; GPT is better for capacity.
+    """
+    website = row.get("website") or row.get("url")
+    html, text = scrape_website_text(website)
+
+    derived: Dict[str, Any] = {"enrichment_status": "NO_DATA"}
+
+    # vendor from page signals
+    signals = sniff_vendor_signals(html, website)
+    vendor = choose_vendor(signals)
+    if vendor:
+        derived["ticket_vendor"] = vendor
+        derived["ticket_vendor_source"] = "SCRAPE"
+
+    # price heuristic
+    avg_price = derive_price_from_text(text)
+    if avg_price is not None:
+        derived["avg_ticket_price"] = avg_price
+        derived["avg_ticket_price_source"] = "SCRAPE"
+
+    # merge GPT
+    if gpt_suggestion:
+        # Prefer scraping for vendor/price; GPT fills capacity and any gaps.
+        if "capacity" in gpt_suggestion and gpt_suggestion["capacity"] is not None:
+            derived["capacity"] = gpt_suggestion["capacity"]
+            derived["capacity_source"] = "GPT"
+        if "ticket_vendor" in gpt_suggestion and "ticket_vendor" not in derived:
+            derived["ticket_vendor"] = gpt_suggestion["ticket_vendor"]
+            derived["ticket_vendor_source"] = "GPT"
+        if "avg_ticket_price" in gpt_suggestion and "avg_ticket_price" not in derived:
+            derived["avg_ticket_price"] = gpt_suggestion["avg_ticket_price"]
+            derived["avg_ticket_price_source"] = "GPT"
+
+    if any(derived.get(k) for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
+        derived["enrichment_status"] = "OK"
+
+    return derived
+
 
 def run_batch(limit: int) -> int:
     rows = fetch_rows(limit)
     processed = 0
     for r in rows:
-        try:
-            name = r["name"]
-        except Exception:
-            name = r.get("organization_name") if isinstance(r, dict) else None
-
         row_dict = _row_to_dict(r)
-        enriched = {"enrichment_status": "NO_DATA"}
         try:
-            suggestion = enrich_with_gpt(name=name, row=row_dict, model=OPENAI_MODEL)
-            if suggestion:
-                enriched.update({k: v for k, v in suggestion.items() if v not in (None, "", {})})
-                if any(enriched.get(k) for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
-                    enriched["enrichment_status"] = "OK"
+            name = row_dict.get("name") or row_dict.get("organization_name")
+        except Exception:
+            name = None
+
+        try:
+            suggestion = enrich_with_gpt(name=name or "", row=row_dict, model=OPENAI_MODEL)
         except Exception as e:
             log.warning("gpt failed: %s", e)
+            suggestion = None
+
+        enriched = _combine_enrichment(row_dict, suggestion)
 
         try:
-            update_in_place(r, enriched)
-            # tiny pause to ease BQ DML pressure (tune/remove if desired)
-            time.sleep(0.05)
+            update_in_place(row_dict, enriched)
+            time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
             processed += 1
         except Exception as e:
             log.error("Failed row: %s: %s", name, e, exc_info=True)
     return processed
 
 
-# ------------------------------------------------------------------------------
-# Routes (no dependency on /healthz required)
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Routes
+# ----------------------------------------------------------------------
 
-# Simple liveness — use this instead of /healthz
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():
     return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
-# Readiness — actually checks BigQuery connectivity in your dataset location
+
 @app.get("/ready")
 def ready():
     try:
-        # fastest possible query; location must match dataset location
         bq.query("SELECT 1", location=BQ_LOCATION).result()
         return jsonify({"ready": True, "bq_location": BQ_LOCATION}), 200
     except Exception as e:
         log.warning("ready check failed: %s", e)
         return jsonify({"ready": False, "error": str(e)}), 503
 
-# Main endpoint: process a batch
+
 @app.route("/", methods=["GET", "HEAD"])
 def root():
-    # HEAD => OK without doing work
     if request.method == "HEAD":
         return ("", 200, {})
     try:
         limit = int(request.args.get("limit", "10"))
     except ValueError:
         limit = 10
-    # optional dry-run (no updates) if you ever need it: /?limit=10&dry=1
     dry = request.args.get("dry") in ("1", "true", "True", "yes")
     try:
         if dry:
@@ -219,18 +296,12 @@ def root():
         return jsonify({"processed": 0, "status": "ERROR", "error": str(e)}), 500
 
 
-# --- Compatibility aliases (you can ignore these) -----------------------------
-# They just return 200 so external health checks never 404 again.
 @app.get("/healthz")
 @app.get("/healthz/")
 @app.get("/_ah/health")
 def _health_compat():
     return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
-
-# ------------------------------------------------------------------------------
-# Entrypoint
-# ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))

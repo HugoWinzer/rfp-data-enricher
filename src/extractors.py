@@ -1,6 +1,7 @@
 import re
+from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,8 +13,8 @@ REQ_TIMEOUT = (8, 20)
 HDRS = {"User-Agent": "Mozilla/5.0 (compatible; rfp-enricher/1.0; +https://example.net)"}
 
 
-# ---------- Normalizers ----------
 def normalize_name(name: str) -> str:
+    """ASCII, lowercase, collapse spaces – helps fuzzy compares."""
     s = unidecode(name or "")
     s = s.lower()
     s = re.sub(r"[’'`´]", " ", s)
@@ -28,7 +29,6 @@ def absolute_link(href: str, base_url: Optional[str]) -> str:
         return href or ""
 
 
-# ---------- Fetch ----------
 def fetch_html(url: str) -> str:
     if not url:
         return ""
@@ -41,9 +41,11 @@ def fetch_html(url: str) -> str:
         return ""
 
 
-# ---------- Vendor sniffing ----------
 def sniff_vendor_signals(html: str, base_url: Optional[str]) -> List[Dict[str, str]]:
-    """Return a list of vendor signal dicts: {'vendor':..., 'evidence':..., 'type': 'link|script'}"""
+    """
+    Return list of {'vendor','evidence','type'} from script/src and anchor/href.
+    Why: vendor widgets/links are the most reliable non-API signal.
+    """
     signals: List[Dict[str, str]] = []
     if not html:
         return signals
@@ -66,7 +68,7 @@ def sniff_vendor_signals(html: str, base_url: Optional[str]) -> List[Dict[str, s
             if any(d in href_l for d in sig.domains) or any(k in text for k in sig.link_keywords):
                 signals.append({"vendor": sig.name, "evidence": absolute_link(href, base_url), "type": "link"})
 
-    # unique-ify
+    # unique
     seen = set()
     uniq = []
     for s in signals:
@@ -90,24 +92,26 @@ def choose_vendor(signals: List[Dict[str, str]]) -> Optional[str]:
     return best
 
 
-# ---------- Prices ----------
+PRICE_RE = re.compile(r"(?:€|eur|euro|£|gbp|usd|\$)?\s*(\d{1,3})(?:[,.](\d{2}))?", re.IGNORECASE)
+
+
 def parse_prices(text: str) -> List[int]:
-    """Very rough price extraction; returns plausible whole numbers."""
+    """Return plausible whole-number prices [3..800] to dampen noisy text."""
     if not text:
         return []
     prices: List[int] = []
-    for m in re.finditer(r"(\d{1,3})([,.]\d{2})?", text):
+    for m in PRICE_RE.finditer(text):
         try:
-            num = int(m.group(1).replace(",", ""))
-            if 3 <= num <= 800:
-                prices.append(num)
+            whole = int(m.group(1))
+            if 3 <= whole <= 800:
+                prices.append(whole)
         except Exception:
             continue
     return prices
 
 
 def scrape_website_text(domain: Optional[str]) -> Tuple[str, str]:
-    """Return (html, text) for domain; empty strings if none."""
+    """Return (html, text) for a given site; empty strings on failure."""
     if not domain:
         return "", ""
     url = domain
@@ -119,3 +123,13 @@ def scrape_website_text(domain: Optional[str]) -> Tuple[str, str]:
     text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
     text = " ".join(text.split())[:50_000]
     return html, text
+
+
+def derive_price_from_text(text: str) -> Optional[int]:
+    vals = parse_prices(text)
+    if not vals:
+        return None
+    try:
+        return int(round(mean(vals)))
+    except Exception:
+        return None

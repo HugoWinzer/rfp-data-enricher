@@ -32,10 +32,11 @@ def enrich_with_gpt(*, name: str, row: Dict[str, Any], model: str = "gpt-4o-mini
     if client is None:
         return None
 
-    website = row.get("website") or row.get("url") or ""
+    # Prefer domain, then website/url
+    website = row.get("domain") or row.get("website") or row.get("url") or ""
     city = row.get("city") or row.get("town") or ""
     country = row.get("country") or ""
-    desc = f"Name: {name}\nWebsite: {website}\nCity: {city}\nCountry: {country}"
+    desc = f"Name: {name}\nWebsite/Domain: {website}\nCity: {city}\nCountry: {country}"
 
     msg = [
         {"role": "system", "content": SYS},

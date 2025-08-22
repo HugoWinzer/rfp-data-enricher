@@ -1,4 +1,3 @@
-# src/enrich_app.py
 #!/usr/bin/env python3
 import os
 import time
@@ -76,7 +75,7 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
 
 
 def get_candidates(limit: int):
-    # Avoid referencing non-existent columns like id/website; keep it generic.
+    # Only reference columns we know exist across your table
     sql = f"""
     SELECT name, domain, ticket_vendor, capacity, avg_ticket_price, enrichment_status, last_updated
     FROM {table_fqdn()}
@@ -121,6 +120,10 @@ def _build_update_sql(for_fields: List[str]) -> str:
 
 def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
     name = row.get("name")
+    if not name:
+        # nothing we can do reliably without a key
+        return
+
     fields_to_set: List[str] = []
     params: List[bigquery.ScalarQueryParameter] = [
         bigquery.ScalarQueryParameter("name", "STRING", name),
@@ -170,13 +173,13 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
 
 
 def _combine_enrichment(row: Dict[str, Any], gpt_suggestion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    # Use 'domain' if available
+    # domain best-effort
     site = row.get("domain") or row.get("website") or row.get("url")
     html, text = scrape_website_text(site)
 
     derived: Dict[str, Any] = {"enrichment_status": "NO_DATA"}
 
-    # Vendor from sniffed signals -> IMPORTANT vendor definition already clarified
+    # Vendor from sniffed signals (payment-funnel software)
     signals = sniff_vendor_signals(html, site)
     vendor = choose_vendor(signals)
     if vendor:
@@ -210,30 +213,24 @@ def run_batch(limit: int) -> Tuple[int, str]:
     processed = 0
     for r in rows:
         row_dict = _row_to_dict(r)
-        name = row_dict.get("name") or row_dict.get("organization_name")
+        name = row_dict.get("name") or row_dict.get("organization_name") or ""
 
         try:
-            suggestion = enrich_with_gpt(name=name or "", row=row_dict, model=OPENAI_MODEL)
+            suggestion = enrich_with_gpt(name=name, row=row_dict, model=OPENAI_MODEL)
         except GPTQuotaExceeded as e:
             log.error("GPT quota exceeded after %d rows: %s", processed, e)
-            # Carry processed count so the handler can return it
-            e.processed_so_far = processed
-            if STOP_ON_GPT_QUOTA:
-                raise e
-            else:
-                suggestion = None
+            # Hard stop
+            raise
         except Exception as e:
-            logging.warning("gpt failed (non-quota): %s", e)
+            log.warning("GPT failed (non-quota): %s", e)
             suggestion = None
-
-        if STOP_ON_GPT_QUOTA and isinstance(suggestion, type(None)) and 'GPT quota' in ''.join([l.getMessage() for l in log.handlers]):  # defensive; will be skipped anyway
-            break
 
         enriched = _combine_enrichment(row_dict, suggestion)
 
         try:
             update_in_place(row_dict, enriched)
             processed += 1
+            # gentle DML pacing
             time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
         except Exception as e:
             log.error("Failed row: %s: %s", name, e, exc_info=True)
@@ -274,8 +271,7 @@ def root():
             count, status = run_batch(limit)
             return jsonify({"processed": count, "status": status}), 200
         except GPTQuotaExceeded as e:
-            # Hard stop on quota
-            return jsonify({"processed": getattr(e, "processed_so_far", 0), "status": "GPT_QUOTA", "error": str(e)}), 503
+            return jsonify({"processed": 0, "status": "GPT_QUOTA", "error": str(e)}), 503
     except Exception as e:
         log.exception("Batch failed")
         return jsonify({"processed": 0, "status": "ERROR", "error": str(e)}), 500

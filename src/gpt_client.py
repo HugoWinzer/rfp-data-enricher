@@ -1,89 +1,83 @@
 import os
 import json
-from typing import Optional, Dict, Any
+import logging
+from typing import Dict, Any, Optional
 
 from openai import OpenAI
 
-_client: Optional[OpenAI] = None
+log = logging.getLogger("gpt_client")
 
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-def _client_or_none() -> Optional[OpenAI]:
-    global _client
-    if _client is not None:
-        return _client
-    if not os.getenv("OPENAI_API_KEY"):
-        return None
-    _client = OpenAI()
-    return _client
+def _client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set (env var or Secret Manager).")
+    return OpenAI(api_key=api_key)
 
+SYSTEM_INSTRUCTIONS = """
+You are a data enricher for a performing arts organizations database.
 
-SYS = (
-    "You are a careful data extractor. "
-    "Given a performing-arts organization, extract: "
-    "ticket_vendor (string like Ticketmaster, Eventbrite, Universe, SeeTickets, etc.), "
-    "capacity (integer), and avg_ticket_price (decimal in local currency). "
-    "If unsure, leave fields null. Output strict JSON with keys "
-    '["ticket_vendor","capacity","avg_ticket_price"].'
-)
+CRUCIAL DEFINITIONS:
+- "ticket_vendor": the software/payment platform that powers the checkout funnel
+  for the organization’s tickets (e.g., Ticketmaster, Eventbrite, See Tickets,
+  Fever, Eventix, Universe, Spektrix, Pretix, Weezevent, Ticket Tailor,
+  YoYo, etc.). It is NOT an aggregator/search site.
 
+TASK:
+Given the org name, website and some scraped text, you must ALWAYS produce:
+- ticket_vendor: string (best guess; pick the actual payment platform; never empty)
+- capacity: integer (estimated if unknown; a plausible venue capacity)
+- avg_ticket_price: number (typical per-ticket price in local currency; estimate if unknown)
 
-def enrich_with_gpt(*, name: str, row: Dict[str, Any], model: str = "gpt-4o-mini") -> Optional[Dict[str, Any]]:
-    client = _client_or_none()
-    if client is None:
-        return None
+CONSTRAINTS:
+- Never return empty values. If uncertain, pick the most plausible guess based on the text.
+- Avoid search/aggregator brands as vendor. Prefer embedded checkout providers/platforms.
+- Return pure JSON with keys exactly: ticket_vendor, capacity, avg_ticket_price.
+"""
 
-    # Prefer domain, then website/url
-    website = row.get("domain") or row.get("website") or row.get("url") or ""
-    city = row.get("city") or row.get("town") or ""
-    country = row.get("country") or ""
-    desc = f"Name: {name}\nWebsite/Domain: {website}\nCity: {city}\nCountry: {country}"
+def enrich_with_gpt(name: str, site: str, scraped_text: str, model: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Ask GPT to ALWAYS fill vendor, capacity, avg_ticket_price.
+    Returns a dict with those keys. Values may be guesses.
+    """
+    model = model or OPENAI_MODEL
+    client = _client()
 
-    msg = [
-        {"role": "system", "content": SYS},
-        {"role": "user", "content": f"Extract fields for:\n{desc}\nReturn JSON only."},
-    ]
+    user_prompt = f"""
+Organization name: {name}
+Website: {site}
 
+SCRAPED_TEXT (may be partial or noisy):
+{scraped_text[:6000]}  # keep token usage reasonable
+
+Return JSON only.
+"""
+
+    resp = client.chat.completions.create(
+        model=model,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_INSTRUCTIONS.strip()},
+            {"role": "user", "content": user_prompt.strip()},
+        ],
+        temperature=0.3,
+    )
+
+    content = resp.choices[0].message.content
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=msg,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            timeout=int(os.getenv("OPENAI_TIMEOUT", "30")),
-        )
-        text = resp.choices[0].message.content.strip()
+        data = json.loads(content)
     except Exception:
-        resp = client.responses.create(
-            model=model,
-            input=msg,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            timeout=int(os.getenv("OPENAI_TIMEOUT", "30")),
-        )
-        text = (getattr(resp, "output_text", "") or "").strip()
+        log.warning("GPT returned non-JSON; content=%r", content)
+        data = {}
 
-    try:
-        data = json.loads(text)
-    except Exception:
-        return None
-
-    out: Dict[str, Any] = {}
+    # Normalize shapes
     tv = data.get("ticket_vendor")
-    if isinstance(tv, str) and tv.strip():
-        out["ticket_vendor"] = tv.strip()
-
     cap = data.get("capacity")
-    if isinstance(cap, (int, float, str)):
-        try:
-            out["capacity"] = int(float(cap))
-        except Exception:
-            pass
-
     price = data.get("avg_ticket_price")
-    if isinstance(price, (int, float, str)):
-        try:
-            out["avg_ticket_price"] = str(price)
-        except Exception:
-            pass
 
-    return out or None
+    return {
+        "ticket_vendor": tv if isinstance(tv, str) and tv.strip() else None,
+        "capacity": cap if isinstance(cap, int) else None,
+        "avg_ticket_price": price,
+    }

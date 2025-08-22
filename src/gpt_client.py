@@ -1,83 +1,112 @@
+# src/gpt_client.py
 import os
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from openai import OpenAI
+from openai import (
+    RateLimitError,
+    PermissionDeniedError,
+    APIStatusError,
+    APIConnectionError,
+    APIError,
+)
 
-log = logging.getLogger("gpt_client")
+log = logging.getLogger(__name__)
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+class GPTQuotaExceeded(Exception):
+    """Raised when OpenAI indicates insufficient quota / hard rate limiting."""
+    def __init__(self, message: str, processed_so_far: int = 0):
+        super().__init__(message)
+        self.processed_so_far = processed_so_far
+
+_client: Optional[OpenAI] = None
 
 def _client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set (env var or Secret Manager).")
-    return OpenAI(api_key=api_key)
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        _client = OpenAI(api_key=api_key)
+    return _client
 
-SYSTEM_INSTRUCTIONS = """
-You are a data enricher for a performing arts organizations database.
-
-CRUCIAL DEFINITIONS:
-- "ticket_vendor": the software/payment platform that powers the checkout funnel
-  for the organization’s tickets (e.g., Ticketmaster, Eventbrite, See Tickets,
-  Fever, Eventix, Universe, Spektrix, Pretix, Weezevent, Ticket Tailor,
-  YoYo, etc.). It is NOT an aggregator/search site.
-
-TASK:
-Given the org name, website and some scraped text, you must ALWAYS produce:
-- ticket_vendor: string (best guess; pick the actual payment platform; never empty)
-- capacity: integer (estimated if unknown; a plausible venue capacity)
-- avg_ticket_price: number (typical per-ticket price in local currency; estimate if unknown)
-
-CONSTRAINTS:
-- Never return empty values. If uncertain, pick the most plausible guess based on the text.
-- Avoid search/aggregator brands as vendor. Prefer embedded checkout providers/platforms.
-- Return pure JSON with keys exactly: ticket_vendor, capacity, avg_ticket_price.
-"""
-
-def enrich_with_gpt(name: str, site: str, scraped_text: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Ask GPT to ALWAYS fill vendor, capacity, avg_ticket_price.
-    Returns a dict with those keys. Values may be guesses.
-    """
-    model = model or OPENAI_MODEL
-    client = _client()
-
-    user_prompt = f"""
-Organization name: {name}
-Website: {site}
-
-SCRAPED_TEXT (may be partial or noisy):
-{scraped_text[:6000]}  # keep token usage reasonable
-
-Return JSON only.
-"""
-
-    resp = client.chat.completions.create(
-        model=model,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_INSTRUCTIONS.strip()},
-            {"role": "user", "content": user_prompt.strip()},
-        ],
-        temperature=0.3,
+def _looks_like_quota_error(err: Exception) -> bool:
+    s = str(err).lower()
+    return (
+        "insufficient_quota" in s
+        or "exceeded your current quota" in s
+        or "rate limit" in s
+        or "429" in s
     )
 
-    content = resp.choices[0].message.content
+def enrich_with_gpt(*, name: str, row: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns a dict like:
+      {
+        "capacity": 300,
+        "ticket_vendor": "Ticketmaster",
+        "avg_ticket_price": 48
+      }
+    or None if GPT couldn't infer non-quota reasons.
+    """
+    prompt = f"""
+You are enriching performing-arts organizations.
+
+Definition (important): "ticket vendor" = the **software company that handles the payment funnel** (e.g., Ticketmaster, See Tickets, Eventbrite, Fever), not the venue itself.
+
+Given the row:
+- name: {name}
+- domain/url: {row.get('domain') or row.get('url') or row.get('website') or ''}
+
+Return compact JSON with possible keys: capacity (int), ticket_vendor (string), avg_ticket_price (int).
+If unsure, omit that key. Do NOT add commentary. Just JSON.
+"""
+
     try:
-        data = json.loads(content)
-    except Exception:
-        log.warning("GPT returned non-JSON; content=%r", content)
-        data = {}
+        resp = _client().chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a precise data enricher."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+    except (RateLimitError, PermissionDeniedError, APIStatusError) as e:
+        if _looks_like_quota_error(e):
+            # Signal the app to stop the batch immediately.
+            raise GPTQuotaExceeded(str(e))
+        raise
+    except (APIConnectionError, APIError) as e:
+        # Transient/other API failures: treat as 'no suggestion' and continue
+        log.warning("GPT transient error: %s", e)
+        return None
 
-    # Normalize shapes
-    tv = data.get("ticket_vendor")
-    cap = data.get("capacity")
-    price = data.get("avg_ticket_price")
+    try:
+        content = resp.choices[0].message.content.strip()
+        # Try to extract JSON
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        data = json.loads(content[start : end + 1])
 
-    return {
-        "ticket_vendor": tv if isinstance(tv, str) and tv.strip() else None,
-        "capacity": cap if isinstance(cap, int) else None,
-        "avg_ticket_price": price,
-    }
+        # sanitize a bit
+        out: Dict[str, Any] = {}
+        if "capacity" in data:
+            try:
+                out["capacity"] = int(data["capacity"])
+            except Exception:
+                pass
+        if "ticket_vendor" in data and isinstance(data["ticket_vendor"], str) and data["ticket_vendor"].strip():
+            out["ticket_vendor"] = data["ticket_vendor"].strip()
+        if "avg_ticket_price" in data:
+            try:
+                out["avg_ticket_price"] = int(data["avg_ticket_price"])
+            except Exception:
+                pass
+        return out or None
+    except Exception as e:
+        log.warning("Failed parsing GPT output: %s", e)
+        return None

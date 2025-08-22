@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
-# --- optional local imports (work both when run as a package or a script) ---
+# Local modules
 try:
     from .gpt_client import enrich_with_gpt
     from .extractors import (
@@ -17,6 +17,8 @@ try:
         sniff_vendor_signals,
         choose_vendor,
         derive_price_from_text,
+        normalize_vendor_name,
+        is_true_ticketing_provider,
     )
 except Exception:
     from gpt_client import enrich_with_gpt
@@ -25,38 +27,47 @@ except Exception:
         sniff_vendor_signals,
         choose_vendor,
         derive_price_from_text,
+        normalize_vendor_name,
+        is_true_ticketing_provider,
     )
 
-# ------------------------- logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enrich_app")
 
-# ------------------------- env & clients -------------------------
+# --- Config ---
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
 TABLE = os.getenv("TABLE", "performing_arts_fixed")
+STAGING_TABLE = os.getenv("STAGING_TABLE", "performing_arts_enriched_stage")
 BQ_LOCATION = os.getenv("BQ_LOCATION")  # e.g. "US", "EU", "europe-southwest1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Throttle between row updates to avoid BQ DML contention
-ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
-ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
+# Delays for pacing BigQuery job churn (applies between batches, not per-row now)
+BATCH_DELAY_MIN_MS = int(os.getenv("BATCH_DELAY_MIN_MS", "100"))
+BATCH_DELAY_MAX_MS = int(os.getenv("BATCH_DELAY_MAX_MS", "300"))
+
+# Hard bounds to clamp GPT guesses
+CAPACITY_MIN = int(os.getenv("CAPACITY_MIN", "30"))
+CAPACITY_MAX = int(os.getenv("CAPACITY_MAX", "20000"))
+PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "5"))
+PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "500"))
 
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
 if not BQ_LOCATION:
     raise RuntimeError("BQ_LOCATION env var is required (e.g. 'US'/'EU'/'region')")
 
-bq = bigquery.Client(project=PROJECT_ID)
-# Some of your snippets referenced BQ in uppercase—make it available too.
-BQ = bq
-
+BQ = bigquery.Client(project=PROJECT_ID)
 app = Flask(__name__)
 app.url_map.strict_slashes = False
 
-# ------------------------- helpers -------------------------
+
 def table_fqdn() -> str:
     return f"`{PROJECT_ID}.{DATASET_ID}.{TABLE}`"
+
+
+def stage_fqdn() -> str:
+    return f"`{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE}`"
 
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
@@ -69,7 +80,6 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
-    # Works with google.cloud.bigquery.table.Row
     try:
         return dict(row.items())
     except Exception:
@@ -79,204 +89,232 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
             return {}
 
 
-def _candidate_predicate() -> str:
-    # Keep this in one place so root() and stats agree
-    return """
-      (avg_ticket_price IS NULL OR capacity IS NULL OR ticket_vendor IS NULL)
-      AND (enrichment_status IS NULL OR enrichment_status NOT IN ('LOCKED'))
+def ensure_stage_table():
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {stage_fqdn()} (
+      id INT64,
+      name STRING,
+      ticket_vendor STRING,
+      ticket_vendor_source STRING,
+      capacity INT64,
+      capacity_source STRING,
+      avg_ticket_price NUMERIC,
+      avg_ticket_price_source STRING,
+      enrichment_status STRING,
+      last_updated TIMESTAMP
+    )
     """
+    BQ.query(ddl, location=BQ_LOCATION).result()
 
 
 def fetch_rows(limit: int):
+    # Only rows missing at least one target field and not LOCKED
     sql = f"""
-    SELECT *
+    SELECT id, name, domain, website, url
     FROM {table_fqdn()}
-    WHERE {_candidate_predicate()}
+    WHERE
+      (ticket_vendor IS NULL OR capacity IS NULL OR avg_ticket_price IS NULL)
+      AND (enrichment_status IS NULL OR enrichment_status NOT IN ('LOCKED'))
     ORDER BY COALESCE(last_updated, TIMESTAMP('1970-01-01')) ASC
     LIMIT @limit
     """
     params = [bigquery.ScalarQueryParameter("limit", "INT64", limit)]
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)
+    job = BQ.query(sql, job_config=job_config, location=BQ_LOCATION)
     return list(job.result())
 
 
-# Backwards-compat with your snippet calling get_candidates()
-def get_candidates(limit: int):
-    return fetch_rows(limit)
+def _clamp_capacity(x: Optional[int]) -> Optional[int]:
+    if x is None:
+        return None
+    try:
+        v = int(x)
+        v = max(CAPACITY_MIN, min(CAPACITY_MAX, v))
+        return v
+    except Exception:
+        return None
 
 
-def _build_update_sql(for_fields: List[str], use_entity_id: bool) -> str:
-    sets = []
-    if "ticket_vendor" in for_fields:
-        sets.append("ticket_vendor = @ticket_vendor")
-    if "capacity" in for_fields:
-        sets.append("capacity = @capacity")
-    if "avg_ticket_price" in for_fields:
-        sets.append("avg_ticket_price = @avg_ticket_price")
-    if "enrichment_status" in for_fields:
-        sets.append("enrichment_status = @enrichment_status")
-    if "ticket_vendor_source" in for_fields:
-        sets.append("ticket_vendor_source = @ticket_vendor_source")
-    if "capacity_source" in for_fields:
-        sets.append("capacity_source = @capacity_source")
-    if "avg_ticket_price_source" in for_fields:
-        sets.append("avg_ticket_price_source = @avg_ticket_price_source")
+def _clamp_price(x: Optional[Decimal]) -> Optional[Decimal]:
+    if x is None:
+        return None
+    try:
+        v = _to_decimal(x)
+        if v is None:
+            return None
+        v = max(PRICE_MIN, min(PRICE_MAX, v))
+        # round to 2 decimals to fit BigQuery NUMERIC typical usage
+        return v.quantize(Decimal("0.01"))
+    except Exception:
+        return None
 
-    sets.append("last_updated = CURRENT_TIMESTAMP()")
-    where_clause = "entity_id = @entity_id" if use_entity_id else "name = @name"
-    sql = f"""
-    UPDATE {table_fqdn()}
-    SET {", ".join(sets)}
-    WHERE {where_clause}
+
+def _combine_enrichment(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    return sql
-
-
-def _extract_row_identity(row: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    Force-fill: vendor, capacity, avg_ticket_price must be present.
+    Sources: SCRAPE > GPT > FALLBACK
     """
-    Returns (entity_id, name). We prefer entity_id (STRING) if available,
-    else we fall back to name.
-    """
-    entity_id = row.get("entity_id")
-    name = row.get("name") or row.get("organization_name")
-    return (entity_id, name)
-
-
-def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
-    entity_id, name = _extract_row_identity(row)
-    if not entity_id and not name:
-        log.warning("Row has no entity_id or name; skipping update.")
-        return
-
-    fields_to_set: List[str] = []
-    params: List[bigquery.ScalarQueryParameter] = []
-
-    # Where param
-    if entity_id:
-        params.append(bigquery.ScalarQueryParameter("entity_id", "STRING", entity_id))
-    else:
-        params.append(bigquery.ScalarQueryParameter("name", "STRING", name))
-
-    # ticket_vendor (+ source)
-    tv = enriched.get("ticket_vendor")
-    if tv:
-        fields_to_set.append("ticket_vendor")
-        params.append(bigquery.ScalarQueryParameter("ticket_vendor", "STRING", tv))
-        src = enriched.get("ticket_vendor_source")
-        if src:
-            fields_to_set.append("ticket_vendor_source")
-            params.append(bigquery.ScalarQueryParameter("ticket_vendor_source", "STRING", src))
-
-    # capacity (+ source)
-    cap = enriched.get("capacity")
-    if cap is not None:
-        try:
-            cap_int = int(cap)
-            fields_to_set.append("capacity")
-            params.append(bigquery.ScalarQueryParameter("capacity", "INT64", cap_int))
-            src = enriched.get("capacity_source")
-            if src:
-                fields_to_set.append("capacity_source")
-                params.append(bigquery.ScalarQueryParameter("capacity_source", "STRING", src))
-        except Exception:
-            # ignore bad capacity
-            pass
-
-    # avg_ticket_price (+ source)
-    price = enriched.get("avg_ticket_price")
-    if price is not None:
-        dec = _to_decimal(price)
-        if dec is not None:
-            fields_to_set.append("avg_ticket_price")
-            params.append(bigquery.ScalarQueryParameter("avg_ticket_price", "NUMERIC", dec))
-            src = enriched.get("avg_ticket_price_source")
-            if src:
-                fields_to_set.append("avg_ticket_price_source")
-                params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", src))
-
-    # enrichment_status
-    status = enriched.get("enrichment_status", "OK")
-    fields_to_set.append("enrichment_status")
-    params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", status))
-
-    if not fields_to_set:
-        # Still stamp last_updated + NO_DATA to avoid re-processing forever
-        fields_to_set = ["enrichment_status"]
-        params = params + [
-            bigquery.ScalarQueryParameter("enrichment_status", "STRING", "NO_DATA"),
-        ]
-
-    sql = _build_update_sql(fields_to_set, use_entity_id=bool(entity_id))
-    log.info("APPLY UPDATE for %s -> %s", entity_id or name, sorted(fields_to_set))
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
-    bq.query(sql, job_config=job_config, location=BQ_LOCATION).result()
-
-
-def _combine_enrichment(row: Dict[str, Any], gpt_suggestion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    # Prefer the 'domain' field if available
+    org_name = (row.get("name") or "").strip()
     site = row.get("domain") or row.get("website") or row.get("url")
+
     html, text = scrape_website_text(site)
 
-    derived: Dict[str, Any] = {"enrichment_status": "NO_DATA"}
-
-    # Vendor via signals
+    # 1) Try scraping signals
     signals = sniff_vendor_signals(html, site)
-    vendor = choose_vendor(signals)
-    if vendor:
-        derived["ticket_vendor"] = vendor
-        derived["ticket_vendor_source"] = "SCRAPE"
+    vendor_scrape = choose_vendor(signals)
+    vendor_scrape = normalize_vendor_name(vendor_scrape) if vendor_scrape else None
 
-    # Average ticket price from page text
-    avg_price = derive_price_from_text(text)
-    if avg_price is not None:
-        derived["avg_ticket_price"] = avg_price
-        derived["avg_ticket_price_source"] = "SCRAPE"
+    price_scrape = derive_price_from_text(text)
 
-    # GPT suggestion (usually for capacity; can backfill vendor/price if needed)
-    if gpt_suggestion:
-        if "capacity" in gpt_suggestion and gpt_suggestion["capacity"] is not None:
-            derived["capacity"] = gpt_suggestion["capacity"]
-            derived["capacity_source"] = "GPT"
-        if "ticket_vendor" in gpt_suggestion and "ticket_vendor" not in derived:
-            derived["ticket_vendor"] = gpt_suggestion["ticket_vendor"]
-            derived["ticket_vendor_source"] = "GPT"
-        if "avg_ticket_price" in gpt_suggestion and "avg_ticket_price" not in derived:
-            derived["avg_ticket_price"] = gpt_suggestion["avg_ticket_price"]
-            derived["avg_ticket_price_source"] = "GPT"
+    # 2) Ask GPT for all three fields (no empties)
+    gpt = None
+    try:
+        gpt = enrich_with_gpt(
+            name=org_name,
+            site=site or "",
+            scraped_text=text or "",
+            model=OPENAI_MODEL,
+        )
+    except Exception as e:
+        log.warning("GPT enrichment failed for %s: %s", org_name, e)
 
-    if any(derived.get(k) for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
-        derived["enrichment_status"] = "OK"
+    # Extract GPT candidates
+    vendor_gpt = normalize_vendor_name((gpt or {}).get("ticket_vendor"))
+    capacity_gpt = _clamp_capacity((gpt or {}).get("capacity"))
+    price_gpt = _clamp_price((gpt or {}).get("avg_ticket_price"))
 
-    return derived
+    # 3) Decide vendor: must be a true ticketing provider (payment funnel), not an aggregator
+    vendor_final: Optional[str] = None
+    vendor_src: Optional[str] = None
+
+    # Prefer scrape if it's a real provider
+    if vendor_scrape and is_true_ticketing_provider(vendor_scrape):
+        vendor_final, vendor_src = vendor_scrape, "SCRAPE"
+    elif vendor_gpt and is_true_ticketing_provider(vendor_gpt):
+        vendor_final, vendor_src = vendor_gpt, "GPT"
+
+    # 4) Decide price
+    price_final: Optional[Decimal] = None
+    price_src: Optional[str] = None
+    if price_scrape is not None:
+        p = _clamp_price(price_scrape)
+        if p is not None:
+            price_final, price_src = p, "SCRAPE"
+    if price_final is None and price_gpt is not None:
+        price_final, price_src = price_gpt, "GPT"
+
+    # 5) Decide capacity
+    capacity_final: Optional[int] = None
+    capacity_src: Optional[str] = None
+    if capacity_gpt is not None:
+        capacity_final, capacity_src = capacity_gpt, "GPT"
+
+    # 6) Force-fill if still missing (very rare if GPT worked)
+    if not vendor_final:
+        vendor_final, vendor_src = "UNKNOWN_VENDOR", "FALLBACK"
+    if capacity_final is None:
+        capacity_final, capacity_src = CAPACITY_MIN, "FALLBACK"  # conservative
+    if price_final is None:
+        price_final, price_src = PRICE_MIN, "FALLBACK"
+
+    # Final dictionary
+    enriched = {
+        "ticket_vendor": vendor_final,
+        "ticket_vendor_source": vendor_src or "FALLBACK",
+        "capacity": capacity_final,
+        "capacity_source": capacity_src or "FALLBACK",
+        "avg_ticket_price": price_final,
+        "avg_ticket_price_source": price_src or "FALLBACK",
+        "enrichment_status": "OK",  # Always OK because fields are force-filled
+    }
+    return enriched
+
+
+def _records_for_stage(original: Dict[str, Any], enriched: Dict[str, Any]) -> Dict[str, Any]:
+    # The update key: prefer id, else name
+    rec = {
+        "id": int(original["id"]) if original.get("id") is not None else None,
+        "name": original.get("name"),
+        "ticket_vendor": enriched["ticket_vendor"],
+        "ticket_vendor_source": enriched.get("ticket_vendor_source"),
+        "capacity": int(enriched["capacity"]) if enriched.get("capacity") is not None else None,
+        "capacity_source": enriched.get("capacity_source"),
+        "avg_ticket_price": str(enriched["avg_ticket_price"]) if enriched.get("avg_ticket_price") is not None else None,
+        "avg_ticket_price_source": enriched.get("avg_ticket_price_source"),
+        "enrichment_status": enriched.get("enrichment_status", "OK"),
+        "last_updated": bigquery.ScalarQueryParameter("", "TIMESTAMP", None)  # ignored; set in UPDATE
+    }
+    return rec
+
+
+def _merge_stage_into_main(use_id: bool):
+    # When id exists, match on id; otherwise match on name
+    on_clause = "T.id = S.id" if use_id else "T.id IS NULL AND T.name = S.name"
+    sql = f"""
+    MERGE {table_fqdn()} T
+    USING {stage_fqdn()} S
+    ON {on_clause}
+    WHEN MATCHED THEN UPDATE SET
+      ticket_vendor = S.ticket_vendor,
+      ticket_vendor_source = S.ticket_vendor_source,
+      capacity = S.capacity,
+      capacity_source = S.capacity_source,
+      avg_ticket_price = S.avg_ticket_price,
+      avg_ticket_price_source = S.avg_ticket_price_source,
+      enrichment_status = S.enrichment_status,
+      last_updated = CURRENT_TIMESTAMP()
+    """
+    BQ.query(sql, location=BQ_LOCATION).result()
+
+
+def _truncate_stage():
+    BQ.query(f"TRUNCATE TABLE {stage_fqdn()}", location=BQ_LOCATION).result()
 
 
 def run_batch(limit: int) -> int:
+    ensure_stage_table()
     rows = fetch_rows(limit)
+    if not rows:
+        return 0
+
+    stage_records_with_id: List[Dict[str, Any]] = []
+    stage_records_no_id: List[Dict[str, Any]] = []
+
     processed = 0
     for r in rows:
-        row_dict = _row_to_dict(r)
-        name = row_dict.get("name") or row_dict.get("organization_name") or row_dict.get("domain") or "?"
-        try:
-            suggestion = enrich_with_gpt(name=name, row=row_dict, model=OPENAI_MODEL)
-        except Exception as e:
-            log.warning("GPT suggestion failed for %s: %s", name, e)
-            suggestion = None
+        row = _row_to_dict(r)
+        enriched = _combine_enrichment(row)
 
-        enriched = _combine_enrichment(row_dict, suggestion)
+        rec = _records_for_stage(row, enriched)
+        if row.get("id") is not None:
+            stage_records_with_id.append(rec)
+        else:
+            stage_records_no_id.append(rec)
+        processed += 1
 
-        try:
-            update_in_place(row_dict, enriched)
-            # reduce DML contention
-            time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
-            processed += 1
-        except Exception as e:
-            log.error("Failed updating %s: %s", name, e, exc_info=True)
+    # Insert into stage and MERGE in two passes (id and name)
+    def _insert_and_merge(batch: List[Dict[str, Any]], use_id: bool):
+        if not batch:
+            return
+        errors = BQ.insert_rows_json(
+            f"{PROJECT_ID}.{DATASET_ID}.{STAGING_TABLE}", batch, row_ids=[None] * len(batch)
+        )
+        if errors:
+            raise RuntimeError(f"insert_rows_json errors: {errors}")
+        _merge_stage_into_main(use_id)
+        _truncate_stage()
+
+    _insert_and_merge(stage_records_with_id, use_id=True)
+    _insert_and_merge(stage_records_no_id, use_id=False)
+
+    # Gentle delay between batches
+    time.sleep(random.uniform(BATCH_DELAY_MIN_MS, BATCH_DELAY_MAX_MS) / 1000.0)
     return processed
 
 
-# ------------------------- routes -------------------------
-@app.route("/ping", methods=["GET", "HEAD"])
+# ------------------- HTTP Endpoints -------------------
+
+@app.get("/ping")
 def ping():
     return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
@@ -284,7 +322,7 @@ def ping():
 @app.get("/ready")
 def ready():
     try:
-        bq.query("SELECT 1", location=BQ_LOCATION).result()
+        BQ.query("SELECT 1", location=BQ_LOCATION).result()
         return jsonify({"ready": True, "bq_location": BQ_LOCATION}), 200
     except Exception as e:
         log.warning("ready check failed: %s", e)
@@ -302,7 +340,7 @@ def root():
     dry = request.args.get("dry") in ("1", "true", "True", "yes")
     try:
         if dry:
-            count = len(get_candidates(limit))
+            count = len(fetch_rows(limit))
             return jsonify({"processed": 0, "candidates": count, "status": "DRY_OK"}), 200
         count = run_batch(limit)
         return jsonify({"processed": count, "status": "OK"}), 200
@@ -311,31 +349,21 @@ def root():
         return jsonify({"processed": 0, "status": "ERROR", "error": str(e)}), 500
 
 
-# Simple, useful stats for quick checks in Cloud Shell
 @app.get("/stats")
 def stats():
     try:
-        # Overview rollup
         q1 = f"""
         SELECT
           COUNT(*) AS total,
           COUNTIF(enrichment_status = 'OK') AS ok,
-          COUNTIF(enrichment_status IS NULL OR enrichment_status != 'OK') AS pending,
           COUNTIF(ticket_vendor IS NOT NULL) AS have_vendor,
           COUNTIF(capacity IS NOT NULL) AS have_capacity,
-          COUNTIF(avg_ticket_price IS NOT NULL) AS have_price,
-          MAX(last_updated) AS last_updated_max
+          COUNTIF(avg_ticket_price IS NOT NULL) AS have_price
         FROM {table_fqdn()}
         """
-        overview_row = list(bq.query(q1, location=BQ_LOCATION).result())[0]
-        overview = _row_to_dict(overview_row)
+        overview = list(BQ.query(q1, location=BQ_LOCATION).result())[0]
+        ov = {k: overview[k] for k in overview.keys()}
 
-        # Backlog count (same predicate as candidate selection)
-        q_backlog = f"SELECT COUNT(*) AS backlog FROM {table_fqdn()} WHERE {_candidate_predicate()}"
-        backlog_row = list(bq.query(q_backlog, location=BQ_LOCATION).result())[0]
-        backlog = _row_to_dict(backlog_row).get("backlog", 0)
-
-        # Top vendors
         q2 = f"""
         SELECT ticket_vendor, COUNT(*) AS c
         FROM {table_fqdn()}
@@ -344,27 +372,10 @@ def stats():
         ORDER BY c DESC
         LIMIT 15
         """
-        vendors = [
-            {"ticket_vendor": r["ticket_vendor"], "count": r["c"]}
-            for r in bq.query(q2, location=BQ_LOCATION).result()
-        ]
-
-        # Recent sample
-        q_recent = f"""
-        SELECT
-          name, domain, ticket_vendor, ticket_vendor_source,
-          capacity, capacity_source, avg_ticket_price, avg_ticket_price_source,
-          enrichment_status, last_updated
-        FROM {table_fqdn()}
-        WHERE last_updated IS NOT NULL
-        ORDER BY last_updated DESC
-        LIMIT 10
-        """
-        recent = [_row_to_dict(r) for r in bq.query(q_recent, location=BQ_LOCATION).result()]
-
-        return jsonify({"overview": overview, "backlog": backlog, "top_vendors": vendors, "recent": recent}), 200
+        vendors = [{"ticket_vendor": r["ticket_vendor"], "count": r["c"]}
+                   for r in BQ.query(q2, location=BQ_LOCATION).result()]
+        return jsonify({"overview": ov, "top_vendors": vendors}), 200
     except Exception as e:
-        log.exception("stats failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -375,7 +386,6 @@ def _health_compat():
     return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
 
 
-# ------------------------- entrypoint -------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)

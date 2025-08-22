@@ -9,7 +9,6 @@ from typing import Dict, Any, Optional, List, Tuple
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 
-# Local modules
 try:
     from .gpt_client import enrich_with_gpt, GPTQuotaExceeded
     from .extractors import (
@@ -30,22 +29,18 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# --- Env ---
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
 TABLE = os.getenv("TABLE", "performing_arts_fixed")
 BQ_LOCATION = os.getenv("BQ_LOCATION")  # e.g. "US", "EU", "europe-southwest1"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Stop entire batch immediately on GPT quota/rate limits (service responds 429)
+# Stop entire batch immediately on GPT quota/rate limits
 STOP_ON_GPT_QUOTA = os.getenv("STOP_ON_GPT_QUOTA", "1").lower() in ("1", "true", "yes")
 
-# Gentle DML pacing (ms) between rows
+# gentle DML pacing
 ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
 ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
-
-# Soft budget to avoid Cloud Run 120s timeout; we 504 early so callers can downshift LIMIT
-REQUEST_BUDGET_SEC = int(os.getenv("REQUEST_BUDGET_SEC", "100"))
 
 if not PROJECT_ID:
     raise RuntimeError("PROJECT_ID env var is required")
@@ -81,15 +76,12 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
 
 
 def get_candidates(limit: int):
-    """
-    Fetch rows that still need enrichment. We only reference columns that exist
-    across your table. Key is 'name' (stable).
-    """
+    # Only reference columns we know exist across your table
     sql = f"""
     SELECT name, domain, ticket_vendor, capacity, avg_ticket_price, enrichment_status, last_updated
     FROM {table_fqdn()}
     WHERE
-      (ticket_vendor IS NULL OR capacity IS NULL OR avg_ticket_price IS NULL)
+      (avg_ticket_price IS NULL OR capacity IS NULL OR ticket_vendor IS NULL)
       AND (enrichment_status IS NULL OR enrichment_status NOT IN ('LOCKED'))
     ORDER BY COALESCE(last_updated, TIMESTAMP('1970-01-01')) ASC
     LIMIT @limit
@@ -118,7 +110,7 @@ def _build_update_sql(for_fields: List[str]) -> str:
         sets.append("avg_ticket_price_source = @avg_ticket_price_source")
 
     sets.append("last_updated = CURRENT_TIMESTAMP()")
-    # Use `name` as the key; it exists on all rows in your table
+    # Use name as the stable key (since some tables have no id)
     sql = f"""
     UPDATE {table_fqdn()}
     SET {", ".join(sets)}
@@ -128,14 +120,10 @@ def _build_update_sql(for_fields: List[str]) -> str:
 
 
 def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
-    """
-    Applies the enrichment back to BigQuery for this row (by name).
-    Sources are written *only if* the value is set so you never have a value
-    without its provenance.
-    """
     name = row.get("name")
     if not name:
-        return  # cannot safely update without a stable key
+        # nothing we can do reliably without a key
+        return
 
     fields_to_set: List[str] = []
     params: List[bigquery.ScalarQueryParameter] = [
@@ -175,14 +163,9 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
                 fields_to_set.append("avg_ticket_price_source")
                 params.append(bigquery.ScalarQueryParameter("avg_ticket_price_source", "STRING", src))
 
-    # Always set a status
     status = enriched.get("enrichment_status", "OK")
     fields_to_set.append("enrichment_status")
     params.append(bigquery.ScalarQueryParameter("enrichment_status", "STRING", status))
-
-    if not fields_to_set:
-        # Nothing to write (should be rare)
-        return
 
     sql = _build_update_sql(fields_to_set)
     log.info("APPLY UPDATE for %s -> %s", name, sorted(fields_to_set))
@@ -191,73 +174,56 @@ def update_in_place(row: Dict[str, Any], enriched: Dict[str, Any]):
 
 
 def _combine_enrichment(row: Dict[str, Any], gpt_suggestion: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Merge scrape-derived values with GPT’s suggestion:
-      - ticket_vendor = payment-funnel software (Ticketmaster, Fever, Eventbrite, etc.)
-      - prefer SCRAPE results; fill gaps with GPT.
-      - write matching *_source fields whenever a value is set.
-    """
+    # domain best-effort
     site = row.get("domain") or row.get("website") or row.get("url")
     html, text = scrape_website_text(site)
 
     derived: Dict[str, Any] = {"enrichment_status": "NO_DATA"}
 
-    # Vendor from payment / checkout signals in HTML
+    # Vendor from sniffed signals (payment-funnel software)
     signals = sniff_vendor_signals(html, site)
     vendor = choose_vendor(signals)
     if vendor:
         derived["ticket_vendor"] = vendor
         derived["ticket_vendor_source"] = "SCRAPE"
 
-    # Price heuristics from text
     avg_price = derive_price_from_text(text)
     if avg_price is not None:
         derived["avg_ticket_price"] = avg_price
         derived["avg_ticket_price_source"] = "SCRAPE"
 
-    # Fill the gaps with GPT
     if gpt_suggestion:
-        if derived.get("capacity") is None and gpt_suggestion.get("capacity") is not None:
+        if "capacity" in gpt_suggestion and gpt_suggestion["capacity"] is not None:
             derived["capacity"] = gpt_suggestion["capacity"]
             derived["capacity_source"] = "GPT"
-        if not derived.get("ticket_vendor") and gpt_suggestion.get("ticket_vendor"):
+        if "ticket_vendor" in gpt_suggestion and "ticket_vendor" not in derived:
             derived["ticket_vendor"] = gpt_suggestion["ticket_vendor"]
             derived["ticket_vendor_source"] = "GPT"
-        if derived.get("avg_ticket_price") is None and gpt_suggestion.get("avg_ticket_price") is not None:
+        if "avg_ticket_price" in gpt_suggestion and "avg_ticket_price" not in derived:
             derived["avg_ticket_price"] = gpt_suggestion["avg_ticket_price"]
             derived["avg_ticket_price_source"] = "GPT"
 
-    if any(derived.get(k) is not None for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
+    if any(derived.get(k) for k in ("ticket_vendor", "capacity", "avg_ticket_price")):
         derived["enrichment_status"] = "OK"
 
     return derived
 
 
 def run_batch(limit: int) -> Tuple[int, str]:
-    """
-    Process up to `limit` rows, respecting a soft time budget so we can return
-    504 before Cloud Run's hard timeout. The caller maps "TIMEOUT" -> HTTP 504.
-    """
-    start = time.time()
     rows = get_candidates(limit)
     processed = 0
-
     for r in rows:
-        if time.time() - start > REQUEST_BUDGET_SEC:
-            log.warning("Time budget exceeded at %d rows; returning TIMEOUT", processed)
-            return processed, "TIMEOUT"
-
         row_dict = _row_to_dict(r)
         name = row_dict.get("name") or row_dict.get("organization_name") or ""
 
         try:
             suggestion = enrich_with_gpt(name=name, row=row_dict, model=OPENAI_MODEL)
         except GPTQuotaExceeded as e:
-            # Bubble up so the HTTP handler can return 429
             log.error("GPT quota exceeded after %d rows: %s", processed, e)
+            # Bubble up so / root can emit 429 if STOP_ON_GPT_QUOTA=1
             raise
         except Exception as e:
-            log.warning("GPT failed (non-quota) on %s: %s", name, e)
+            log.warning("GPT failed (non-quota): %s", e)
             suggestion = None
 
         enriched = _combine_enrichment(row_dict, suggestion)
@@ -265,15 +231,12 @@ def run_batch(limit: int) -> Tuple[int, str]:
         try:
             update_in_place(row_dict, enriched)
             processed += 1
-            # Gentle DML pacing
+            # gentle DML pacing
             time.sleep(random.uniform(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
         except Exception as e:
-            log.error("Failed row update for '%s': %s", name, e, exc_info=True)
-
+            log.error("Failed row: %s: %s", name, e, exc_info=True)
     return processed, "OK"
 
-
-# -------------------- HTTP endpoints --------------------
 
 @app.get("/ping")
 def ping():
@@ -294,8 +257,6 @@ def ready():
 def root():
     if request.method == "HEAD":
         return ("", 200, {})
-
-    # Query params
     try:
         limit = int(request.args.get("limit", "10"))
     except ValueError:
@@ -309,13 +270,11 @@ def root():
 
         try:
             count, status = run_batch(limit)
-            if status == "TIMEOUT":
-                return jsonify({"processed": count, "status": status}), 504
             return jsonify({"processed": count, "status": status}), 200
-
         except GPTQuotaExceeded as e:
-            # Return 429 so your shell loop/scheduler stops immediately
-            return jsonify({"processed": 0, "status": "QUOTA", "error": str(e)}), 429
+            # When STOP_ON_GPT_QUOTA is true, emit 429 so your caller/loop halts immediately.
+            code = 429 if STOP_ON_GPT_QUOTA else 200
+            return jsonify({"processed": 0, "status": "GPT_QUOTA", "error": str(e)}), code
 
     except Exception as e:
         log.exception("Batch failed")
@@ -348,7 +307,6 @@ def stats():
         """
         vendors = [{"ticket_vendor": r["ticket_vendor"], "count": r["c"]}
                    for r in BQ.query(q2, location=BQ_LOCATION).result()]
-
         return jsonify({"overview": ov, "top_vendors": vendors}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

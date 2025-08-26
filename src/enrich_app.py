@@ -3,8 +3,8 @@ import os
 import time
 import random
 import logging
-from decimal import Decimal, InvalidOperation
-from typing import Dict, Any, Optional, List, Tuple
+from decimal import Decimal
+from typing import Dict, Any, List
 
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
@@ -20,16 +20,10 @@ try:
         normalize_vendor_name,
         is_true_ticketing_provider,
         vendor_from_ticketmaster,
-        vendor_from_eventbrite,
         avg_price_from_google_places,
-        phone_from_google_places,
         extract_linkedin_url,
-        extract_phone_numbers,
         extract_alt_name,
         extract_descriptions,
-        detect_rfp,
-        extract_charge_pct,
-        extract_revenues,
         extract_capacity,
     )
 except Exception:
@@ -42,16 +36,10 @@ except Exception:
         normalize_vendor_name,
         is_true_ticketing_provider,
         vendor_from_ticketmaster,
-        vendor_from_eventbrite,
         avg_price_from_google_places,
-        phone_from_google_places,
         extract_linkedin_url,
-        extract_phone_numbers,
         extract_alt_name,
         extract_descriptions,
-        detect_rfp,
-        extract_charge_pct,
-        extract_revenues,
         extract_capacity,
     )
 
@@ -63,18 +51,19 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
-TABLE = os.getenv("TABLE", "culture_merged")
+TABLE = os.getenv("TABLE", "OUTPUT")
 BQ_LOCATION = os.getenv("BQ_LOCATION")  # e.g., "europe-southwest1"
 
 ENABLE_TICKETMASTER = os.getenv("ENABLE_TICKETMASTER", "1") == "1"
 ENABLE_PLACES = os.getenv("ENABLE_PLACES", "1") == "1"
-ENABLE_EVENTBRITE = os.getenv("ENABLE_EVENTBRITE", "0") == "1"
+# Explicitly ignore Eventbrite
+ENABLE_EVENTBRITE = False
 
 ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
 ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
 STOP_ON_GPT_QUOTA = os.getenv("STOP_ON_GPT_QUOTA", "0") == "1"
 
-# Optional column name overrides to adapt to unknown schema
+# Optional column name overrides
 KEY_COL = os.getenv("KEY_COL", "id")
 NAME_COL = os.getenv("NAME_COL", "name")
 WEBSITE_COL = os.getenv("WEBSITE_COL", "website")
@@ -91,43 +80,70 @@ def _tbl() -> str:
 
 
 def _sleep_jitter():
-    if ROW_DELAY_MAX_MS <= ROW_DELAY_MIN_MS:
-        ms = ROW_DELAY_MIN_MS
-    else:
-        ms = random.randint(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS)
+    ms = ROW_DELAY_MIN_MS if ROW_DELAY_MAX_MS <= ROW_DELAY_MIN_MS else random.randint(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS)
     time.sleep(ms / 1000.0)
 
 
 def _pick_candidates(limit: int) -> List[Dict[str, Any]]:
     """
-    Conservative candidate picker:
-      - Prefer rows not yet marked DONE in enrichment_status (if column exists).
-      - Otherwise just pick recent rows with a website.
+    Pick rows that are not LOCKED and still missing any target fields.
+    Uses dynamic SQL so it won't break if a column is absent.
     """
     sql = f"""
     DECLARE has_status BOOL DEFAULT EXISTS (
-      SELECT 1
-      FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+      SELECT 1 FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
       WHERE table_name = '{TABLE}' AND column_name = '{ENRICH_STATUS_COL}'
     );
+    DECLARE has_vendor BOOL DEFAULT EXISTS (
+      SELECT 1 FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+      WHERE table_name = '{TABLE}' AND column_name = 'ticket_vendor'
+    );
+    DECLARE has_capacity BOOL DEFAULT EXISTS (
+      SELECT 1 FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+      WHERE table_name = '{TABLE}' AND column_name = 'capacity'
+    );
+    DECLARE has_price BOOL DEFAULT EXISTS (
+      SELECT 1 FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+      WHERE table_name = '{TABLE}' AND column_name = 'avg_ticket_price'
+    );
+    DECLARE has_website BOOL DEFAULT EXISTS (
+      SELECT 1 FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+      WHERE table_name = '{TABLE}' AND column_name = '{WEBSITE_COL}'
+    );
+
+    DECLARE where_parts ARRAY<STRING> DEFAULT [
+      IF(has_status, 'IFNULL({ENRICH_STATUS_COL}, "") != "LOCKED"', 'TRUE'),
+      IF(has_website, '{WEBSITE_COL} IS NOT NULL', 'TRUE'),
+      '(' ||
+        IF(has_vendor, 'ticket_vendor IS NULL', 'FALSE') || ' OR ' ||
+        IF(has_capacity, 'capacity IS NULL', 'FALSE') || ' OR ' ||
+        IF(has_price, 'avg_ticket_price IS NULL', 'FALSE') ||
+      ')'
+    ];
 
     EXECUTE IMMEDIATE (
-      SELECT IF(
-        has_status,
-        'SELECT {KEY_COL} AS id, {NAME_COL} AS name, {WEBSITE_COL} AS website, {ENRICH_STATUS_COL} AS status
-           FROM { _tbl() }
-          WHERE IFNULL({ENRICH_STATUS_COL}, "") != "DONE"
-            AND {WEBSITE_COL} IS NOT NULL
-          LIMIT {limit}',
-        'SELECT {KEY_COL} AS id, {NAME_COL} AS name, {WEBSITE_COL} AS website, NULL AS status
-           FROM { _tbl() }
-          WHERE {WEBSITE_COL} IS NOT NULL
-          LIMIT {limit}'
-      )
+      'SELECT {KEY_COL} AS id, {NAME_COL} AS name, {WEBSITE_COL} AS website' ||
+      IF(has_status, ', {ENRICH_STATUS_COL} AS status', ', NULL AS status') ||
+      ' FROM {tbl} WHERE ' || ARRAY_TO_STRING(where_parts, ' AND ') ||
+      ' LIMIT {limit}'
     )
+    USING tbl AS { _tbl() }, limit AS {limit};
     """
     job = bq_client.query(sql)
     return [dict(r) for r in job.result()]
+
+
+def _bq_param(name: str, value: Any) -> bigquery.ScalarQueryParameter:
+    if isinstance(value, bool):
+        return bigquery.ScalarQueryParameter(name, "BOOL", value)
+    if isinstance(value, int):
+        return bigquery.ScalarQueryParameter(name, "INT64", value)
+    if isinstance(value, float):
+        return bigquery.ScalarQueryParameter(name, "FLOAT64", value)
+    if isinstance(value, Decimal):
+        # BigQuery NUMERIC via string to preserve precision
+        return bigquery.ScalarQueryParameter(name, "NUMERIC", str(value))
+    return bigquery.ScalarQueryParameter(name, "STRING", value)
 
 
 def _update_row(row_id: Any, updates: Dict[str, Any], dry: bool) -> None:
@@ -135,94 +151,79 @@ def _update_row(row_id: Any, updates: Dict[str, Any], dry: bool) -> None:
         logging.info(f"[DRY] Would update {row_id} with {updates}")
         return
 
-    # Build a parameterized UPDATE for only the provided keys
     set_clauses = []
     params = []
-    for i, (k, v) in enumerate(updates.items(), start=1):
+    i = 0
+    for k, v in updates.items():
+        i += 1
         set_clauses.append(f"`{k}` = @p{i}")
-        params.append(bigquery.ScalarQueryParameter(f"p{i}", "STRING" if isinstance(v, str) else "NUMERIC" if isinstance(v, (int, float, Decimal)) else "STRING", None if v is None else str(v) if isinstance(v, Decimal) else v))
+        params.append(_bq_param(f"p{i}", v))
 
-    if not set_clauses:
-        return
+    # Always bump last_updated if column exists
+    set_sql = ", ".join(set_clauses) + ", last_updated = CURRENT_TIMESTAMP()"
 
     sql = f"""
     UPDATE { _tbl() }
-       SET {", ".join(set_clauses)}
+       SET {set_sql}
      WHERE `{KEY_COL}` = @row_id
     """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("row_id", "STRING", str(row_id)),
-            *params,
-        ]
-    )
-    job = bq_client.query(sql, job_config=job_config)
-    job.result()
+    job_config = bigquery.QueryJobConfig(query_parameters=[_bq_param("row_id", str(row_id)), *params])
+    bq_client.query(sql, job_config=job_config).result()
     logging.info(f"UPDATED {row_id}: {list(updates.keys())}")
 
 
 def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Combines extractor heuristics with GPT results.
-    Returns the dict of updates to write.
+    Combine heuristics, APIs and GPT. Return a dict of updates to write.
+    Ensures no NULLs by supplying defaults when needed.
     """
     name = row.get("name") or row.get(NAME_COL)
     website = row.get("website") or row.get(WEBSITE_COL)
 
-    # Scrape + extract heuristics
+    # Scrape + extract heuristics (no phones)
     website_text = scrape_website_text(website) if website else ""
     alt_name = extract_alt_name(website_text)
     descriptions = extract_descriptions(website_text)
-    phone_candidates = extract_phone_numbers(website_text)
     linkedin = extract_linkedin_url(website_text)
 
-    # External APIs (guarded)
+    # External APIs
     places_price = None
-    places_phone = None
     if ENABLE_PLACES and name:
         places_price = avg_price_from_google_places(name, website)  # may be None
-        places_phone = phone_from_google_places(name, website)
 
-    # Ticketing vendor sniff
+    # Ticketing vendor sniff (Ticketmaster only; Eventbrite ignored)
     signals = sniff_vendor_signals(website_text)
     tm_vendor = vendor_from_ticketmaster(name, website) if ENABLE_TICKETMASTER else None
-    eb_vendor = vendor_from_eventbrite(name, website) if ENABLE_EVENTBRITE else None
-    vendor_guess = tm_vendor or eb_vendor or choose_vendor(signals)
+    vendor_guess = tm_vendor or choose_vendor(signals)
     vendor = normalize_vendor_name(vendor_guess) if vendor_guess else None
-    vendor_source = None
-    if tm_vendor:
-        vendor_source = "ticketmaster"
-    elif eb_vendor:
-        vendor_source = "eventbrite"
-    elif vendor:
-        vendor_source = "heuristic"
+    vendor_source = "ticketmaster" if tm_vendor else ("heuristic" if vendor else None)
 
     # Heuristic price/capacity from site text
     price_heur, price_src = derive_price_from_text(website_text)
     capacity_heur = extract_capacity(website_text)
 
-    # GPT enrichment (with router/fallbacks)
+    # GPT enrichment (no phone field)
     try:
         gpt_update = enrich_with_gpt(
             row_dict={
                 "name": name,
                 "alt_name": alt_name,
                 "website_url": website,
-                "description": descriptions[:512] if descriptions else None,
+                "description": (descriptions[:512] if descriptions else None),
                 "website_text": website_text,
-                "phone": places_phone or (phone_candidates[0] if phone_candidates else None),
+                "linkedin_url": linkedin,
             }
         )
     except GPTQuotaExceeded as e:
-        if os.getenv("STOP_ON_GPT_QUOTA", "0") == "1":
+        if STOP_ON_GPT_QUOTA:
             raise
-        logging.error(f"GPT quota exceeded, continuing without GPT for {name}: {e}")
+        logging.error(f"GPT quota exceeded for {name}: {e}")
         gpt_update = {}
 
-    # Merge all sources with precedence: GPT > Places/heuristics
+    # Merge with precedence: GPT > Places/heuristics, then defaults (no NULLs)
     updates: Dict[str, Any] = {}
 
-    # Price
+    # --- avg_ticket_price ---
     avg_price = gpt_update.get("avg_ticket_price")
     if avg_price is None:
         avg_price = places_price or price_heur
@@ -230,27 +231,42 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
             updates["avg_ticket_price_source"] = "places" if places_price is not None else (price_src or "heuristic")
     else:
         updates["avg_ticket_price_source"] = "gpt"
-    if avg_price is not None:
-        updates["avg_ticket_price"] = avg_price
+    if avg_price is None:
+        avg_price = 0
+        updates["avg_ticket_price_source"] = updates.get("avg_ticket_price_source", "none")
+    updates["avg_ticket_price"] = avg_price
 
-    # Capacity
+    # --- capacity ---
     capacity = gpt_update.get("capacity")
-    if capacity is None and capacity_heur:
-        capacity = capacity_heur
-        updates["capacity_source"] = "heuristic"
-    elif capacity is not None:
+    if capacity is None:
+        capacity = capacity_heur if capacity_heur is not None else 0
+        updates["capacity_source"] = "heuristic" if capacity_heur is not None else "none"
+    else:
         updates["capacity_source"] = "gpt"
-    if capacity is not None:
+    try:
         updates["capacity"] = int(capacity)
+    except Exception:
+        updates["capacity"] = 0
+        updates["capacity_source"] = "none"
 
-    # Vendor
+    # --- ticket_vendor ---
     if vendor and is_true_ticketing_provider(vendor):
         updates["ticket_vendor"] = vendor
         updates["ticket_vendor_source"] = vendor_source or "heuristic"
+    else:
+        updates["ticket_vendor"] = "Unknown"
+        updates["ticket_vendor_source"] = "none"
 
-    # Always mark status when we did any work
-    if updates:
-        updates["enrichment_status"] = "DONE"
+    # Optional nice-to-haves (never required)
+    if linkedin:
+        updates["linkedin_url"] = linkedin
+    if alt_name:
+        updates["alt_name"] = alt_name
+    if descriptions:
+        updates["description"] = descriptions[:1024]
+
+    # Mark status
+    updates["enrichment_status"] = "OK"
 
     return updates
 
@@ -265,7 +281,6 @@ def ping():
 
 @app.get("/ready")
 def ready():
-    # simple readiness + echo location so you can see it in curl
     return jsonify({"bq_location": BQ_LOCATION, "ready": True})
 
 
@@ -273,11 +288,8 @@ def ready():
 def run_enrichment():
     limit = int(request.args.get("limit", "50"))
     dry = request.args.get("dry", "0") in ("1", "true", "True", "yes")
-
-    # Safety: clamp limit
     limit = max(1, min(limit, 500))
 
-    # Fetch candidates
     try:
         rows = _pick_candidates(limit)
     except Exception as e:
@@ -296,14 +308,11 @@ def run_enrichment():
             logging.error(f"GPT quota exceeded after {processed} rows: {e}")
             if STOP_ON_GPT_QUOTA:
                 return jsonify({"status": "QUOTA_HIT", "processed": processed}), 429
-            # else continue to next row
         except Exception as e:
             logging.exception(f"Row failed: {row}")
-            # continue processing
 
     return jsonify({
         "candidates": len(rows),
         "processed": processed,
         "status": "DRY_OK" if dry else "OK",
     })
-

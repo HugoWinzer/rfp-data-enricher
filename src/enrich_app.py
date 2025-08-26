@@ -98,7 +98,10 @@ def _sleep_jitter():
 
 def _pick_candidates(limit: int) -> List[Dict[str, Any]]:
     """
-    Prefer rows not marked OK; otherwise any row with a website.
+    Pick rows that still need work even if status is OK:
+      - revenues IS NULL  (backfill revenues)
+      - OR enrichment_status != 'OK'
+    Always skip LOCKED rows.
     """
     sql = f"""
     DECLARE has_status BOOL DEFAULT EXISTS (
@@ -106,17 +109,20 @@ def _pick_candidates(limit: int) -> List[Dict[str, Any]]:
       FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
       WHERE table_name = '{TABLE}' AND column_name = '{ENRICH_STATUS_COL}'
     );
+
     EXECUTE IMMEDIATE (
       SELECT IF(
         has_status,
         'SELECT {KEY_COL} AS id, {NAME_COL} AS name, {WEBSITE_COL} AS website, {ENRICH_STATUS_COL} AS status
            FROM { _tbl() }
-          WHERE IFNULL({ENRICH_STATUS_COL}, "") != "OK"
-            AND {WEBSITE_COL} IS NOT NULL
+          WHERE {WEBSITE_COL} IS NOT NULL
+            AND IFNULL({ENRICH_STATUS_COL}, "") != "LOCKED"
+            AND (revenues IS NULL OR IFNULL({ENRICH_STATUS_COL}, "") != "OK")
           LIMIT {limit}',
         'SELECT {KEY_COL} AS id, {NAME_COL} AS name, {WEBSITE_COL} AS website, NULL AS status
            FROM { _tbl() }
           WHERE {WEBSITE_COL} IS NOT NULL
+            AND revenues IS NULL
           LIMIT {limit}'
       )
     )
@@ -184,7 +190,7 @@ def _gpt_estimate_revenue(
         user = {
             "task": "Estimate yearly ticket revenue with reasonable assumptions.",
             "known_values": known,
-            "website_text_excerpt": website_text[:1800],  # keep prompt small
+            "website_text_excerpt": website_text[:1800],
         }
         resp = _openai.chat.completions.create(
             model=OPENAI_MODEL,
@@ -197,7 +203,6 @@ def _gpt_estimate_revenue(
         raw = resp.choices[0].message.content.strip()
         data = json.loads(raw)
         rev = data.get("revenue_estimate")
-        # sanitize
         if isinstance(rev, (int, float)) and rev >= 0:
             return int(rev)
         return None
@@ -234,7 +239,7 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     price_heur, _price_src = derive_price_from_text(website_text)
     capacity_heur          = extract_capacity(website_text)
 
-    # General GPT pass (keeps all the other extractions you already had)
+    # General GPT pass
     try:
         gpt_update = enrich_with_gpt(
             row_dict={
@@ -243,7 +248,6 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
                 "website_url": website,
                 "description": descriptions[:512] if descriptions else None,
                 "website_text": website_text,
-                # IMPORTANT: tell the prompt-builder we need a yearly revenue estimate
                 "request_revenues_estimate": True,
                 "estimation_note": (
                     "Please estimate events_per_year, load/utilization, and output a revenue figure."
@@ -294,11 +298,11 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     if cap_val is not None:
         updates["capacity"] = int(cap_val)
 
-    # vendor (ignore Eventbrite if you want—controlled by flag)
+    # vendor
     if vendor and is_true_ticketing_provider(vendor):
         updates["ticket_vendor"] = vendor
 
-    # linkedin if you have a column for it
+    # linkedin
     if linkedin:
         updates["linkedin_url"] = linkedin
 
@@ -323,7 +327,6 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # 3) hard fallback only if GPT fails completely
     if revenues_val is None:
-        # conservative but not-null fallback so the dashboard never shows NULL
         p = avg_price_val if avg_price_val is not None else DEFAULT_AVG_TICKET_PRICE
         c = cap_val if cap_val is not None else DEFAULT_CAPACITY
         e = DEFAULT_EVENTS_PER_YEAR
@@ -332,7 +335,7 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
 
     updates["revenues"] = revenues_val
 
-    # Done
+    # Done — keep marking OK when we update anything (skips LOCKED because we don't pick them)
     if updates:
         updates["enrichment_status"] = "OK"
 

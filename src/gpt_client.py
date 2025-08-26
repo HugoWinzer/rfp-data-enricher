@@ -1,85 +1,70 @@
-#!/usr/bin/env python3
-import os
+# src/gpt_client.py
+from __future__ import annotations
 import json
-import math
 import logging
-from typing import Any, Dict, Optional
-
-
+from typing import Dict, Any, Tuple, List
 from openai import OpenAI
-from openai import APIError
-try:
-from openai import RateLimitError
-except Exception:
-RateLimitError = APIError
-
-
-log = logging.getLogger(__name__)
-
-
-
-
-def _env_int(name: str, default: int) -> int:
-try:
-return int(os.getenv(name, str(default)))
-except Exception:
-return default
-
-
-CAPACITY_MIN = _env_int("CAPACITY_MIN", 30)
-CAPACITY_MAX = _env_int("CAPACITY_MAX", 20000)
-PRICE_MIN = _env_int("PRICE_MIN", 5)
-PRICE_MAX = _env_int("PRICE_MAX", 250)
-REV_MAX = float(os.getenv("REV_MAX", "2000000000")) # 2B
-PCT_MAX = float(os.getenv("PCT_MAX", "25"))
-
-
+from .model_router import QuotaAwareRouter
 
 
 class GPTQuotaExceeded(Exception):
 pass
 
 
+_client = OpenAI()
+_router = QuotaAwareRouter(_client)
 
 
-def _client_singleton() -> OpenAI:
-global _CLIENT
+_SYSTEM = (
+"You are a data enrichment assistant for a cultural venues dataset. "
+"Given the venue name, website text, and hints, extract missing fields. "
+"When you don't know, return null."
+)
+
+
+# We ask for concise JSON to simplify parsing
+_USER_TMPL = (
+"Name: {name}\n"
+"City: {city}\n"
+"Website: {website}\n"
+"Hints: {hints}\n\n"
+"Website text (truncated):\n{website_text}\n\n"
+"Return strict JSON with keys: \n"
+" avg_ticket_price:number|null, avg_ticket_price_source:string|null,\n"
+" capacity:integer|null, capacity_source:string|null,\n"
+" ticket_vendor:string|null, ticket_vendor_source:string|null,\n"
+" short_description:string|null, long_description:string|null,\n"
+" phone:string|null, phone_source:string|null,\n"
+" linkedin_url:string|null.\n"
+)
+
+
+_DEF_MAXTOK = 400
+
+
+
+
+def _call(messages: List[Dict[str, Any]], max_tokens: int = _DEF_MAXTOK) -> Tuple[str, str]:
 try:
-return _CLIENT
-except NameError:
-_CLIENT = OpenAI()
-return _CLIENT
+resp, used_model = _router.chat(messages=messages, max_tokens=max_tokens, temperature=0)
+text = resp.choices[0].message.content or "{}"
+return text, used_model
+except Exception as e:
+# For calling code, treat this as quota to reuse existing STOP_ON_GPT_QUOTA logic
+raise GPTQuotaExceeded(str(e))
 
 
 
 
-def _clamp_num(n: Optional[float], lo: float, hi: float) -> Optional[float]:
-if n is None:
-return None
-try:
-f = float(n)
-except Exception:
-return None
-if math.isnan(f) or math.isinf(f):
-return None
-return max(lo, min(hi, f))
+def enrich_with_gpt(row: Dict[str, Any], website_text: str, hints: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+name = row.get("name") or row.get("org_name") or ""
+city = row.get("city") or row.get("locality") or ""
+website = row.get("website") or row.get("url") or ""
 
 
-
-
-def _build_prompt(name: str, row: Dict[str, Any]) -> str:
-domain = row.get("domain") or ""
-category = row.get("category") or ""
-return f"""
-You enrich cultural venue records. If data is not public, estimate plausibly.
-
-
-Definitions:
-- ticket vendor = payment-funnel software powering checkout (Ticketmaster, Eventbrite, Fever, Spektrix, Tessitura, Universe, See Tickets, Pretix, etc.). Not a marketplace/aggregator.
-- size tiers by annual_revenue: Diamond ≥ 20M; Gold 4–<20M; Silver 2–<4M; Bronze < 2M.
-- charge_pct = % commission per ticket (typical 2–10%%; clamp 0–25%%).
-- rfp = entity has ever issued a Request for Proposal.
-
-
-Always output ALL fields as JSON (no comments):
-return None
+user = _USER_TMPL.format(
+name=name,
+city=city,
+website=website,
+hints=json.dumps(hints, ensure_ascii=False),
+return parsed, used_model

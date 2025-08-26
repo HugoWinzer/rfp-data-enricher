@@ -1,44 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Expect env vars to be already exported or set defaults
+
 PROJECT_ID="${PROJECT_ID:-rfp-database-464609}"
-REGION="${REGION:-europe-west1}"
-SERVICE="${SERVICE:-data-enricher}"
-REPO="${REPO:-rfp-enricher}"
+REGION="${REGION:-us-central1}"
+SERVICE="${SERVICE:-rfp-data-enricher}"
 BQ_LOCATION="${BQ_LOCATION:-europe-southwest1}"
-CONCURRENCY="${CONCURRENCY:-1}"
-MAX_INSTANCES="${MAX_INSTANCES:-2}"
+
 
 gcloud config set project "$PROJECT_ID"
 
-# Ensure Artifact Registry exists
-gcloud artifacts repositories create "$REPO" \
-  --repository-format=DOCKER \
-  --location="$REGION" \
-  --description="RFP Enricher images" || true
 
-# Build & push
-TAG="fix-$(date +%Y%m%d-%H%M%S)"
-IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}:${TAG}"
-echo "Building $IMAGE ..."
-gcloud builds submit . --tag "$IMAGE" --timeout=1200
+# Build
+gcloud builds submit --tag "gcr.io/$PROJECT_ID/$SERVICE:latest"
 
-# Deploy
-echo "Deploying $SERVICE ..."
+
+# Deploy (secrets via Secret Manager, no plaintext keys)
 gcloud run deploy "$SERVICE" \
-  --region "$REGION" \
-  --image "$IMAGE" \
-  --allow-unauthenticated \
-  --concurrency "$CONCURRENCY" \
-  --max-instances "$MAX_INSTANCES" \
-  --set-env-vars "PROJECT_ID=${PROJECT_ID},DATASET_ID=rfpdata,TABLE=performing_arts_fixed,BQ_LOCATION=${BQ_LOCATION}" \
-  --set-env-vars "OPENAI_MAX_RETRIES=5,OPENAI_TIMEOUT=30,ROW_DELAY_MIN_MS=50,ROW_DELAY_MAX_MS=250,BQ_MAX_RETRIES=5" \
-  --set-secrets "OPENAI_API_KEY=openai-api-key:latest,MASTER_KEY=ticketmaster-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest"
+--image "gcr.io/$PROJECT_ID/$SERVICE:latest" \
+--region "$REGION" \
+--allow-unauthenticated \
+--set-secrets OPENAI_API_KEY=openai-api-key:latest,TICKETMASTER_KEY=ticketmaster-key:latest,GOOGLE_PLACES_KEY=google-places-key:latest,EVENTBRITE_TOKEN=eventbrite-token:latest \
+--set-env-vars PROJECT_ID="$PROJECT_ID",DATASET_ID="rfpdata",TABLE="performing_arts_fixed",BQ_LOCATION="$BQ_LOCATION",OPENAI_MODEL="gpt-4o-mini",ROW_DELAY_MIN_MS="30",ROW_DELAY_MAX_MS="180",STOP_ON_GPT_QUOTA="1",ENABLE_TICKETMASTER="1",ENABLE_PLACES="1",ENABLE_EVENTBRITE="1" \
+--max-instances=1 --concurrency=1 --min-instances=1
 
-echo
-echo "Deployed image:"
-gcloud run services describe "$SERVICE" --region "$REGION" --format='value(spec.template.spec.containers[0].image)'
-echo
-echo "Service URL:"
-gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)'
+
+# Print URL
+SERVICE_URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
+echo "Service URL: $SERVICE_URL"
+
+
+# Smoke test
+curl -sS "$SERVICE_URL/ping"; echo
+curl -sS "$SERVICE_URL/ready"; echo
+curl -sS "$SERVICE_URL/?limit=5&dry=1"; echo
+curl -sS "$SERVICE_URL/?limit=5"; echo
+
+
+# Tail logs for API hits
+gcloud run services logs tail "$SERVICE" --region "$REGION" --since=20m | egrep -i 'API_TM|API_EB|API_PLACES|APPLY UPDATE|GPT quota|429'

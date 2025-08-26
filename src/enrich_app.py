@@ -187,7 +187,7 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     signals = sniff_vendor_signals(website_text)
     tm_vendor = vendor_from_ticketmaster(name, website) if ENABLE_TICKETMASTER else None
     eb_vendor = vendor_from_eventbrite(name, website) if ENABLE_EVENTBRITE else None
-    vendor_guess = choose_vendor(signals, tm_vendor or eb_vendor)
+    vendor_guess = tm_vendor or eb_vendor or choose_vendor(signals)
     vendor = normalize_vendor_name(vendor_guess) if vendor_guess else None
     vendor_source = None
     if tm_vendor:
@@ -306,3 +306,4 @@ def run_enrichment():
         "processed": processed,
         "status": "DRY_OK" if dry else "OK",
     })
+

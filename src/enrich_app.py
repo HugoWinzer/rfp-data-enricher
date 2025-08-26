@@ -1,81 +1,129 @@
-# src/enrich_app.py
-from __future__ import annotations
-import os, time, random, logging
-from typing import Dict, Any, List, Tuple
+# src/gpt_client.py
+import json
+import logging
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Tuple
+
+from openai import OpenAI
+from .model_router import QuotaAwareRouter
 
 
-from flask import Flask, request, jsonify
-from google.cloud import bigquery
-from google.api_core import retry, exceptions
+@dataclass
+class GPTQuotaExceeded(Exception):
+    """Raised when all models are exhausted due to rate limits."""
+    message: str = "OpenAI rate limit hit"
 
 
-# Local imports — keep your existing extractors
-try:
-from .gpt_client import enrich_with_gpt, GPTQuotaExceeded
-from .extractors import (
-scrape_website_text,
-sniff_vendor_signals,
-choose_vendor,
-derive_price_from_text,
-normalize_vendor_name,
-is_true_ticketing_provider,
-vendor_from_ticketmaster,
-vendor_from_eventbrite,
-avg_price_from_google_places,
-phone_from_google_places,
-extract_linkedin_url,
-extract_phone_numbers,
-extract_alt_name,
-extract_descriptions,
-detect_rfp,
-extract_charge_pct,
-extract_revenues,
-extract_capacity,
-)
-except Exception:
-from gpt_client import enrich_with_gpt, GPTQuotaExceeded
-from extractors import (
-scrape_website_text,
-sniff_vendor_signals,
-choose_vendor,
-derive_price_from_text,
-normalize_vendor_name,
-is_true_ticketing_provider,
-vendor_from_ticketmaster,
-vendor_from_eventbrite,
-avg_price_from_google_places,
-phone_from_google_places,
-extract_linkedin_url,
-extract_phone_numbers,
-extract_alt_name,
-extract_descriptions,
-detect_rfp,
-extract_charge_pct,
-extract_revenues,
-extract_capacity,
-)
+def _to_decimal_safe(x: Any) -> Decimal | None:
+    if x is None or x == "":
+        return None
+    try:
+        return Decimal(str(x))
+    except (InvalidOperation, ValueError):
+        return None
 
 
-# --- App / logging ---
-app = Flask(__name__)
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+def _build_messages(context: Dict[str, Any]) -> List[Dict[str, str]]:
+    # Keep it compact to minimize tokens.
+    sys = (
+        "You enrich venue/org records for a culture DB. "
+        "Return strict JSON with keys: avg_ticket_price (number or null), "
+        "capacity (integer or null). If unknown, use null. Do not guess."
+    )
+    parts = []
+    for key in ("name", "alt_name", "website_url", "source_url", "phone", "city", "state", "country"):
+        if context.get(key):
+            parts.append(f"{key}: {context.get(key)}")
+    if context.get("website_text"):
+        # truncate to keep token use small
+        txt = str(context["website_text"])
+        if len(txt) > 4000:
+            txt = txt[:4000]
+        parts.append(f"website_text:\n{txt}")
+    if context.get("description"):
+        parts.append(f"description:\n{context['description']}")
+    user = " \n".join(parts) if parts else "No context."
+
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
 
 
-# --- Config ---
-PROJECT_ID = os.getenv("PROJECT_ID")
-DATASET_ID = os.getenv("DATASET_ID")
-TABLE = os.getenv("TABLE")
-BQ_LOCATION = os.getenv("BQ_LOCATION", "US")
+class GPTClient:
+    def __init__(self, client: OpenAI | None = None):
+        self.client = client or OpenAI()
+        self.router = QuotaAwareRouter(self.client)
+
+    def enrich(self, context: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        """
+        Returns (update_dict, model_used).
+        update_dict has keys:
+          - avg_ticket_price (Decimal|None)
+          - avg_ticket_price_source ("gpt" if set)
+          - capacity (int|None)
+          - capacity_source ("gpt" if set)
+          - enrichment_status ("DONE" always on success)
+        """
+        messages = _build_messages(context)
+        try:
+            resp, used_model = self.router.chat(
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0,
+                max_tokens=200,
+            )
+        except Exception as e:
+            # If this is a router "all exhausted", surface a clean signal
+            raise GPTQuotaExceeded(str(e))
+
+        text = resp.choices[0].message.content or "{}"
+        try:
+            data = json.loads(text)
+        except Exception:
+            logging.warning("Non-JSON response from model; falling back to best-effort parse")
+            data = {}
+
+        price = _to_decimal_safe(data.get("avg_ticket_price"))
+        cap_raw = data.get("capacity")
+        try:
+            cap = int(cap_raw) if cap_raw is not None else None
+        except Exception:
+            cap = None
+
+        update = {
+            "avg_ticket_price": price,
+            "avg_ticket_price_source": ("gpt" if price is not None else None),
+            "capacity": cap,
+            "capacity_source": ("gpt" if cap is not None else None),
+            "enrichment_status": "DONE",
+        }
+        return update, used_model
 
 
-ENABLE_TICKETMASTER = os.getenv("ENABLE_TICKETMASTER", "1") == "1"
-ENABLE_PLACES = os.getenv("ENABLE_PLACES", "1") == "1"
-ENABLE_EVENTBRITE = os.getenv("ENABLE_EVENTBRITE", "0") == "1" # default disabled
-STOP_ON_GPT_QUOTA = os.getenv("STOP_ON_GPT_QUOTA", "1") == "1"
-ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
-ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
+# Backwards-compatible shim
+def enrich_with_gpt(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Accepts either:
+      - enrich_with_gpt(row_dict=..., **extras)
+      - enrich_with_gpt(context_dict)
+      - enrich_with_gpt(**context_fields)
+    Returns `update` dict only (for existing call sites).
+    """
+    if args and isinstance(args[0], dict) and not kwargs:
+        context: Dict[str, Any] = args[0]
+    else:
+        context = {}
+        # named `row_dict` wins
+        if "row_dict" in kwargs and isinstance(kwargs["row_dict"], dict):
+            context.update(kwargs.pop("row_dict"))
+        context.update(kwargs)
 
-
-# BigQuery Client
-app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    client = GPTClient()
+    update, used_model = client.enrich(context)
+    # Optional: let caller see the model via logging
+    name = context.get("name") or context.get("alt_name") or context.get("website_url") or "row"
+    updated_keys = [k for k, v in update.items() if v is not None]
+    logging.info(f"APPLY UPDATE for {name} -> {updated_keys} (model={used_model})")
+    return update

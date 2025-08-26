@@ -1,82 +1,87 @@
+#!/usr/bin/env python3
 import os
+import time
+import random
+import logging
+from decimal import Decimal, InvalidOperation
+from typing import Dict, Any, Optional, List, Tuple
 
 
-@app.get("/ready")
-def ready():
+from flask import Flask, request, jsonify
+from google.cloud import bigquery
+
+
 try:
-BQ.query("SELECT 1", location=BQ_LOCATION).result()
-return ("ready", 200, {"Content-Type": "text/plain; charset=utf-8"})
+from .gpt_client import enrich_with_gpt, GPTQuotaExceeded
+from .extractors import (
+scrape_website_text,
+sniff_vendor_signals,
+choose_vendor,
+derive_price_from_text,
+normalize_vendor_name,
+is_true_ticketing_provider,
+vendor_from_ticketmaster,
+vendor_from_eventbrite,
+avg_price_from_google_places,
+)
 except Exception:
-return ("not ready", 503, {"Content-Type": "text/plain; charset=utf-8"})
+from gpt_client import enrich_with_gpt, GPTQuotaExceeded
+from extractors import (
+scrape_website_text,
+sniff_vendor_signals,
+choose_vendor,
+derive_price_from_text,
+normalize_vendor_name,
+is_true_ticketing_provider,
+vendor_from_ticketmaster,
+vendor_from_eventbrite,
+avg_price_from_google_places,
+)
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+
+PROJECT_ID = os.getenv("PROJECT_ID")
+DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
+TABLE = os.getenv("TABLE", "performing_arts_fixed")
+BQ_LOCATION = os.getenv("BQ_LOCATION") # e.g. "US", "EU", "europe-southwest1"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+# Stop entire batch immediately on GPT quota/rate limits
+STOP_ON_GPT_QUOTA = os.getenv("STOP_ON_GPT_QUOTA", "1").lower() in ("1", "true", "yes")
+
+
+# gentle DML pacing
+ROW_DELAY_MIN_MS = int(os.getenv("ROW_DELAY_MIN_MS", "30"))
+ROW_DELAY_MAX_MS = int(os.getenv("ROW_DELAY_MAX_MS", "180"))
+
+
+if not PROJECT_ID:
+raise RuntimeError("PROJECT_ID env var is required")
+if not BQ_LOCATION:
+raise RuntimeError("BQ_LOCATION env var is required (e.g. 'US'/'EU'/'region')")
+
+
+BQ = bigquery.Client(project=PROJECT_ID)
+app = Flask(__name__)
+app.url_map.strict_slashes = False
 
 
 
 
-@app.get("/")
-@app.get("/batch")
-def index():
-if request.method != "GET":
-return ("", 200, {})
+def table_fqdn() -> str:
+return f"`{PROJECT_ID}.{DATASET_ID}.{TABLE}`"
+
+
+
+
+def _row_to_dict(row) -> Dict[str, Any]:
 try:
-limit = int(request.args.get("limit", "10"))
-except ValueError:
-limit = 10
-dry = request.args.get("dry") in ("1", "true", "True", "yes")
-
-
+return dict(row.items())
+except Exception:
 try:
-if dry:
-count = len(get_candidates(limit))
-return jsonify({"processed": 0, "candidates": count, "status": "DRY_OK"}), 200
-
-
-try:
-count, status = run_batch(limit)
-return jsonify({"processed": count, "status": status}), 200
-except GPTQuotaExceeded as e:
-# When STOP_ON_GPT_QUOTA is true, emit 429 so your caller/loop halts immediately.
-code = 429 if STOP_ON_GPT_QUOTA else 200
-return jsonify({"processed": 0, "status": "GPT_QUOTA", "error": str(e)}), code
-
-
-except Exception as e:
-log.exception("Batch failed")
-return jsonify({"processed": 0, "status": "ERROR", "error": str(e)}), 500
-
-
-
-
-@app.get("/stats")
-def stats():
-try:
-q1 = f"""
-SELECT
-COUNT(*) total,
-COUNTIF(enrichment_status = 'OK') ok,
-COUNTIF(enrichment_status IS NULL OR enrichment_status != 'OK') pending,
-COUNTIF(ticket_vendor IS NOT NULL) have_vendor,
-COUNTIF(capacity IS NOT NULL) have_capacity,
-COUNTIF(avg_ticket_price IS NOT NULL) have_price
-FROM {table_fqdn()}
-"""
-j = BQ.query(q1, location=BQ_LOCATION).result()
-row = list(j)[0]
-return jsonify(dict(row)), 200
-except Exception as e:
-return jsonify({"error": str(e)}), 500
-
-
-
-
-@app.get("/healthz")
-@app.get("/healthz/")
-@app.get("/_ah/health")
-def _health_compat():
-return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
-
-
-
-
-if __name__ == "__main__":
-port = int(os.environ.get("PORT", "8080"))
+return dict(row)
 app.run(host="0.0.0.0", port=port)

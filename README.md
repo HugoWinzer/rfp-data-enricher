@@ -1,25 +1,12 @@
-# RFP Data Enricher (Cloud Run)
+### Batch endpoints
+- `GET /?limit=N` → run a batch
+- `GET /?limit=N&dry=1` → count candidates only
+- `GET /stats` → field coverage stats
 
 
-Small Flask service that enriches BigQuery rows using OpenAI.
+### Required secrets
+- `openai-api-key`, `ticketmaster-key`, `google-places-key`, `eventbrite-token`
 
 
-## Endpoints
-- `GET /healthz` → `ok`
-- `GET /?limit=25` → runs a batch (1–100)
-
-
-## Required env
-- `PROJECT_ID=rfp-database-464609`
-- `DATASET_ID=rfpdata`
-- `TABLE=performing_arts_fixed`
-- `BQ_LOCATION=europe-southwest1`
-- `OPENAI_API_KEY` (secret)
-- `OPENAI_MODEL` (default `gpt-4o-mini`)
-
-
-## Local run
-```bash
-pip install -r requirements.txt
-export PROJECT_ID=rfp-database-464609 DATASET_ID=rfpdata TABLE=p...ming_arts_fixed BQ_LOCATION=europe-southwest1 OPENAI_API_KEY=...
-python -m src.enrich_app
+### Env
+`PROJECT_ID, DATASET_ID=rfpdata, TABLE=culture_merged, BQ_LOCATION=europe-southwest1, OPENAI_MODEL=gpt-4o-mini, STOP_ON_GPT_QUOTA=1`

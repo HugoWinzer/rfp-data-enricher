@@ -87,6 +87,21 @@ OCCUPANCY_DEFAULT        = float(os.getenv("OCCUPANCY_DEFAULT", "0.6"))  # used 
 
 bq_client = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
+# Cache table columns so we only write fields that exist
+_COLUMNS_CACHE: Optional[set[str]] = None
+def _load_columns() -> set[str]:
+    global _COLUMNS_CACHE
+    if _COLUMNS_CACHE is None:
+        rows = bq_client.query(
+            f"SELECT column_name FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS` "
+            f"WHERE table_name = @t",
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("t", "STRING", TABLE)]
+            )
+        ).result()
+        _COLUMNS_CACHE = {r["column_name"] for r in rows}
+    return _COLUMNS_CACHE
+
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -131,10 +146,18 @@ def _pick_candidates(limit: int) -> List[Dict[str, Any]]:
     job = bq_client.query(sql)
     return [dict(r) for r in job.result()]
 
+def _filter_updates_to_existing_columns(updates: Dict[str, Any]) -> Dict[str, Any]:
+    cols = _load_columns()
+    return {k: v for k, v in updates.items() if k in cols}
+
 def _update_row(row_id: Any, updates: Dict[str, Any], dry: bool) -> None:
     if dry:
         logging.info(f"[DRY] Would update {row_id} with {updates}")
         return
+    if not updates:
+        return
+
+    updates = _filter_updates_to_existing_columns(updates)
     if not updates:
         return
 
@@ -293,22 +316,22 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     if cap_val is not None:
         updates["capacity"] = int(cap_val)
 
-    # frequency_per_year (new, from GPT)
+    # frequency_per_year (from GPT) — only write if column exists
     freq_val: Optional[int] = None
     if gpt_update.get("frequency_per_year") is not None:
         try:
             freq_val = int(gpt_update["frequency_per_year"])
         except Exception:
             freq_val = None
-    if freq_val is not None:
+    if freq_val is not None and "frequency_per_year" in _load_columns():
         updates["frequency_per_year"] = int(freq_val)
 
     # vendor
     if vendor and is_true_ticketing_provider(vendor):
         updates["ticket_vendor"] = vendor
 
-    # linkedin
-    if linkedin:
+    # linkedin (only if column exists)
+    if linkedin and "linkedin_url" in _load_columns():
         updates["linkedin_url"] = linkedin
 
     # --------------------- revenues: prefer local compute with GPT freq --------
@@ -320,7 +343,7 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
         revenues_val = float(avg_price_val) * cap_val * freq_val * OCCUPANCY_DEFAULT
         revenues_src = f"computed(gpt_fields)@occ={OCCUPANCY_DEFAULT}"
 
-    # Case B: otherwise, use your dedicated estimator that infers events/year & load
+    # Case B: otherwise, use the dedicated estimator that infers events/year & load
     if revenues_val is None:
         est = _gpt_estimate_revenue(
             name=name,

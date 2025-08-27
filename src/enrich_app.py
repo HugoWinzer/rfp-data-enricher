@@ -78,11 +78,12 @@ NAME_COL          = os.getenv("NAME_COL", "name")
 WEBSITE_COL       = os.getenv("WEBSITE_COL", "website")
 ENRICH_STATUS_COL = os.getenv("ENRICH_STATUS_COL", "enrichment_status")
 
-# Conservative defaults (only used if GPT completely unavailable)
+# Revenue knobs
 DEFAULT_CAPACITY         = int(os.getenv("DEFAULT_CAPACITY", "200"))
 DEFAULT_AVG_TICKET_PRICE = Decimal(os.getenv("DEFAULT_AVG_TICKET_PRICE", "25"))
 DEFAULT_EVENTS_PER_YEAR  = int(os.getenv("DEFAULT_EVENTS_PER_YEAR", "20"))
 DEFAULT_LOAD_FACTOR      = Decimal(os.getenv("DEFAULT_LOAD_FACTOR", "0.7"))
+OCCUPANCY_DEFAULT        = float(os.getenv("OCCUPANCY_DEFAULT", "0.6"))  # used if we compute locally
 
 bq_client = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
@@ -134,7 +135,6 @@ def _update_row(row_id: Any, updates: Dict[str, Any], dry: bool) -> None:
     if dry:
         logging.info(f"[DRY] Would update {row_id} with {updates}")
         return
-
     if not updates:
         return
 
@@ -220,10 +220,9 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     website_text  = scrape_website_text(website) if website else ""
     alt_name      = extract_alt_name(website_text)
     descriptions  = extract_descriptions(website_text)
-    # We ignore phone enrichment per request, but we still parse LinkedIn
     linkedin      = extract_linkedin_url(website_text)
 
-    # Google Places only for price (phone skipped)
+    # Google Places only for price
     places_price = None
     if ENABLE_PLACES and name:
         places_price = avg_price_from_google_places(name, website)
@@ -239,7 +238,7 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     price_heur, _price_src = derive_price_from_text(website_text)
     capacity_heur          = extract_capacity(website_text)
 
-    # General GPT pass
+    # General GPT pass (now returns frequency_per_year as well)
     try:
         gpt_update = enrich_with_gpt(
             row_dict={
@@ -248,10 +247,6 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
                 "website_url": website,
                 "description": descriptions[:512] if descriptions else None,
                 "website_text": website_text,
-                "request_revenues_estimate": True,
-                "estimation_note": (
-                    "Please estimate events_per_year, load/utilization, and output a revenue figure."
-                ),
             }
         ) or {}
     except GPTQuotaExceeded as e:
@@ -298,6 +293,16 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     if cap_val is not None:
         updates["capacity"] = int(cap_val)
 
+    # frequency_per_year (new, from GPT)
+    freq_val: Optional[int] = None
+    if gpt_update.get("frequency_per_year") is not None:
+        try:
+            freq_val = int(gpt_update["frequency_per_year"])
+        except Exception:
+            freq_val = None
+    if freq_val is not None:
+        updates["frequency_per_year"] = int(freq_val)
+
     # vendor
     if vendor and is_true_ticketing_provider(vendor):
         updates["ticket_vendor"] = vendor
@@ -306,34 +311,38 @@ def _enrich_one(row: Dict[str, Any]) -> Dict[str, Any]:
     if linkedin:
         updates["linkedin_url"] = linkedin
 
-    # --------------------- revenues: GPT estimate (events/year aware) ----------
-    revenues_val: Optional[int] = None
+    # --------------------- revenues: prefer local compute with GPT freq --------
+    revenues_val: Optional[float] = None
+    revenues_src = None
 
-    # 1) take revenues from the general GPT if it already produced one
-    if gpt_update.get("revenues") is not None:
-        try:
-            revenues_val = int(float(gpt_update["revenues"]))
-        except Exception:
-            revenues_val = None
+    # Case A: compute directly if we have price+capacity+frequency (from GPT or heuristics)
+    if avg_price_val is not None and cap_val is not None and freq_val is not None:
+        revenues_val = float(avg_price_val) * cap_val * freq_val * OCCUPANCY_DEFAULT
+        revenues_src = f"computed(gpt_fields)@occ={OCCUPANCY_DEFAULT}"
 
-    # 2) otherwise, run the dedicated estimator prompt that infers events/year
+    # Case B: otherwise, use your dedicated estimator that infers events/year & load
     if revenues_val is None:
-        revenues_val = _gpt_estimate_revenue(
+        est = _gpt_estimate_revenue(
             name=name,
             website_text=website_text,
             avg_ticket_price=avg_price_val,
             capacity=cap_val,
         )
+        if est is not None:
+            revenues_val = float(est)
+            revenues_src = "gpt_estimator"
 
-    # 3) hard fallback only if GPT fails completely
+    # Case C: hard fallback if GPT completely unavailable
     if revenues_val is None:
         p = avg_price_val if avg_price_val is not None else DEFAULT_AVG_TICKET_PRICE
         c = cap_val if cap_val is not None else DEFAULT_CAPACITY
         e = DEFAULT_EVENTS_PER_YEAR
         lf = DEFAULT_LOAD_FACTOR
-        revenues_val = int((p * c * lf * e).to_integral_value())
+        revenues_val = float((p * c * lf * e))
+        revenues_src = "fallback_formula"
 
-    updates["revenues"] = revenues_val
+    updates["revenues"] = round(revenues_val, 2)
+    updates["revenues_source"] = revenues_src or "unknown"
 
     # Done — keep marking OK when we update anything (skips LOCKED because we don't pick them)
     if updates:

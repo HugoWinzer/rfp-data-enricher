@@ -28,8 +28,12 @@ def _build_messages(context: Dict[str, Any]) -> List[Dict[str, str]]:
     # Keep it compact to minimize tokens.
     sys = (
         "You enrich venue/org records for a culture DB. "
-        "Return strict JSON with keys: avg_ticket_price (number or null), "
-        "capacity (integer or null). If unknown, use null. Do not guess."
+        "Return strict JSON with keys: "
+        "avg_ticket_price (number or null), "
+        "capacity (integer or null), "
+        "frequency_per_year (integer or null). "
+        "Infer typical event frequency when reasonable (weekly≈52, monthly≈12; residencies 150–300). "
+        "If unclear, use null. Do not invent details."
     )
     parts = []
     for key in ("name", "alt_name", "website_url", "source_url", "phone", "city", "state", "country"):
@@ -64,6 +68,8 @@ class GPTClient:
           - avg_ticket_price_source ("gpt" if set)
           - capacity (int|None)
           - capacity_source ("gpt" if set)
+          - frequency_per_year (int|None)
+          - frequency_source ("gpt" if set)
           - enrichment_status ("DONE" always on success)
         """
         messages = _build_messages(context)
@@ -72,7 +78,7 @@ class GPTClient:
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0,
-                max_tokens=200,
+                max_tokens=220,
             )
         except Exception as e:
             # If this is a router "all exhausted", surface a clean signal
@@ -86,17 +92,26 @@ class GPTClient:
             data = {}
 
         price = _to_decimal_safe(data.get("avg_ticket_price"))
+
         cap_raw = data.get("capacity")
         try:
             cap = int(cap_raw) if cap_raw is not None else None
         except Exception:
             cap = None
 
+        freq_raw = data.get("frequency_per_year")
+        try:
+            freq = int(freq_raw) if freq_raw is not None else None
+        except Exception:
+            freq = None
+
         update = {
             "avg_ticket_price": price,
             "avg_ticket_price_source": ("gpt" if price is not None else None),
             "capacity": cap,
             "capacity_source": ("gpt" if cap is not None else None),
+            "frequency_per_year": freq,
+            "frequency_source": ("gpt" if freq is not None else None),
             "enrichment_status": "DONE",
         }
         return update, used_model

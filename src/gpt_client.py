@@ -24,23 +24,45 @@ def _to_decimal_safe(x: Any) -> Decimal | None:
         return None
 
 
+def _to_int_safe(x: Any) -> int | None:
+    try:
+        if x is None or x == "":
+            return None
+        return int(str(x).strip())
+    except Exception:
+        return None
+
+
+def _to_float01_safe(x: Any) -> float | None:
+    try:
+        if x is None or x == "":
+            return None
+        v = float(str(x).strip())
+        if v < 0:
+            v = 0.0
+        if v > 1:
+            v = 1.0
+        return v
+    except Exception:
+        return None
+
+
 def _build_messages(context: Dict[str, Any]) -> List[Dict[str, str]]:
     # Keep it compact to minimize tokens.
     sys = (
-        "You enrich venue/org records for a culture DB. "
-        "Return strict JSON with keys: "
-        "avg_ticket_price (number or null), "
-        "capacity (integer or null), "
-        "frequency_per_year (integer or null). "
-        "Infer typical event frequency when reasonable (weekly≈52, monthly≈12; residencies 150–300). "
-        "If unclear, use null. Do not invent details."
+        "You enrich venue/performing-arts org records. "
+        "Return strict JSON with keys:\n"
+        "- avg_ticket_price (number or null)\n"
+        "- capacity (integer or null)\n"
+        "- events_per_year (integer or null)  # approximate typical annual frequency\n"
+        "- occupancy (number 0..1 or null)    # typical load factor\n"
+        "If unknown, use null. Do not invent URLs. Keep numbers realistic."
     )
     parts = []
-    for key in ("name", "alt_name", "website_url", "source_url", "phone", "city", "state", "country"):
+    for key in ("name", "alt_name", "website_url", "phone", "city", "state", "country"):
         if context.get(key):
             parts.append(f"{key}: {context.get(key)}")
     if context.get("website_text"):
-        # truncate to keep token use small
         txt = str(context["website_text"])
         if len(txt) > 4000:
             txt = txt[:4000]
@@ -64,13 +86,10 @@ class GPTClient:
         """
         Returns (update_dict, model_used).
         update_dict has keys:
-          - avg_ticket_price (Decimal|None)
-          - avg_ticket_price_source ("gpt" if set)
-          - capacity (int|None)
-          - capacity_source ("gpt" if set)
-          - frequency_per_year (int|None)
-          - frequency_source ("gpt" if set)
-          - enrichment_status ("DONE" always on success)
+          - avg_ticket_price (Decimal|None), capacity (int|None),
+          - events_per_year (int|None), occupancy (float|None in 0..1)
+          - *_source fields for price/capacity if set by GPT
+          - enrichment_status ("DONE")
         """
         messages = _build_messages(context)
         try:
@@ -81,37 +100,27 @@ class GPTClient:
                 max_tokens=220,
             )
         except Exception as e:
-            # If this is a router "all exhausted", surface a clean signal
             raise GPTQuotaExceeded(str(e))
 
         text = resp.choices[0].message.content or "{}"
         try:
             data = json.loads(text)
         except Exception:
-            logging.warning("Non-JSON response from model; falling back to best-effort parse")
+            logging.warning("Non-JSON response from model; falling back to empty object")
             data = {}
 
         price = _to_decimal_safe(data.get("avg_ticket_price"))
+        cap = _to_int_safe(data.get("capacity"))
+        events = _to_int_safe(data.get("events_per_year"))
+        occ = _to_float01_safe(data.get("occupancy"))
 
-        cap_raw = data.get("capacity")
-        try:
-            cap = int(cap_raw) if cap_raw is not None else None
-        except Exception:
-            cap = None
-
-        freq_raw = data.get("frequency_per_year")
-        try:
-            freq = int(freq_raw) if freq_raw is not None else None
-        except Exception:
-            freq = None
-
-        update = {
+        update: Dict[str, Any] = {
             "avg_ticket_price": price,
             "avg_ticket_price_source": ("gpt" if price is not None else None),
             "capacity": cap,
             "capacity_source": ("gpt" if cap is not None else None),
-            "frequency_per_year": freq,
-            "frequency_source": ("gpt" if freq is not None else None),
+            "events_per_year": events,
+            "occupancy": occ,
             "enrichment_status": "DONE",
         }
         return update, used_model
@@ -130,14 +139,12 @@ def enrich_with_gpt(*args, **kwargs) -> Dict[str, Any]:
         context: Dict[str, Any] = args[0]
     else:
         context = {}
-        # named `row_dict` wins
         if "row_dict" in kwargs and isinstance(kwargs["row_dict"], dict):
             context.update(kwargs.pop("row_dict"))
         context.update(kwargs)
 
     client = GPTClient()
     update, used_model = client.enrich(context)
-    # Optional: let caller see the model via logging
     name = context.get("name") or context.get("alt_name") or context.get("website_url") or "row"
     updated_keys = [k for k, v in update.items() if v is not None]
     logging.info(f"APPLY UPDATE for {name} -> {updated_keys} (model={used_model})")

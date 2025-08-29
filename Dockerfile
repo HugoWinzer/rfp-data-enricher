@@ -1,4 +1,3 @@
-# Dockerfile (root)
 FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8080
 WORKDIR /app
@@ -6,5 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
-ENV PYTHONPATH=/app
-CMD ["gunicorn","-w","2","-b","0.0.0.0:8080","src.madrid_enricher:app"]
+# IMPORTANT: make 'src' the import root
+ENV PYTHONPATH=/app/src
+# use one worker to lower memory + make cold start simpler
+CMD ["gunicorn","-w","1","-b","0.0.0.0:8080","src.madrid_enricher:app"]

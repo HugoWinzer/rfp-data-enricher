@@ -1,41 +1,42 @@
-from textwrap import dedent
+# src/revenue_prompt.py
+"""
+Minimal prompt used by the Madrid pilot to estimate GTV (annual gross ticket revenue).
+We return a compact JSON so src.madrid_enricher can parse it safely.
+"""
 
-SYSTEM_PROMPT = dedent("""
-You are a cautious financial estimator for performing arts events.
-Your single job: estimate total event REVENUE in USD for a specific show/series, using rough heuristics.
+SYSTEM_PROMPT = """You are a careful revenue estimator for cultural venues and events.
+Goal: estimate ANNUAL gross ticket revenue (GTV) in USD for the provided entity.
+Use any provided hints (capacity, average ticket price, annual visitors, notes).
+If info is missing, make a conservative estimate for Madrid based on typical sizes.
 
-INPUT FIELDS you may receive:
-- name (show or organization)
-- domain (website)
-- city, country (optional)
-- capacity (typical seats)  → may be noisy
-- avg_ticket_price (typical USD) → may be noisy
-- event_date or run_dates (optional)
-- url_path or source_url (optional free text with hints)
+Rules:
+- Return ONLY a minified JSON object with keys: revenue_usd (number), confidence ("low"|"medium"|"high"), assumptions (string <= 400 chars).
+- Do not include markdown or extra text.
+- Use USD.
+"""
 
-Ground rules:
-- Use simple heuristics and common-sense ranges for attendance (sell-through) and comps/fees.
-- Prefer conservative mid-point estimates unless strong signals suggest otherwise.
-- If capacity and avg_ticket_price exist, estimate:
-    baseline = capacity * avg_ticket_price
-    sell_through between 40%–90% depending on signals; default 60%.
-    Adjust for fees/discounts only if clearly stated.
-- If missing capacity OR price, infer ballpark from context (small theater 100–300 seats, mid 300–1200, large 1200–3000+; community events often <$25; commercial tours $40–$150).
-- Never return ranges; return one number that is your best single-point estimate in USD.
-- Always return strict JSON: {"revenue_usd": number, "confidence": "LOW|MEDIUM|HIGH", "assumptions": "..."}.
-""").strip()
-
-def build_user_prompt(row: dict) -> str:
-    # Row fields expected: name, domain, capacity, avg_ticket_price, city, country, run_dates, extra_context
-    return (
-        "{"
-        f"\"name\": {row.get('name')!r}, "
-        f"\"domain\": {row.get('domain')!r}, "
-        f"\"capacity\": {row.get('capacity')!r}, "
-        f"\"avg_ticket_price\": {row.get('avg_ticket_price')!r}, "
-        f"\"city\": {row.get('city')!r}, "
-        f"\"country\": {row.get('country')!r}, "
-        f"\"run_dates\": {row.get('run_dates')!r}, "
-        f"\"extra_context\": {row.get('extra_context')!r}"
-        "}"
-    )
+def build_user_prompt(ctx: dict) -> str:
+    """
+    Build a compact, readable prompt from row context.
+    ctx keys we may get: name, domain, city, country, capacity, avg_ticket_price, annual_visitors, notes, source_url
+    """
+    lines = []
+    lines.append("Entity:")
+    lines.append(f"- name: {ctx.get('name')}")
+    if ctx.get('domain'):
+        lines.append(f"- website: {ctx['domain']}")
+    if ctx.get('city') or ctx.get('country'):
+        lines.append(f"- location: {ctx.get('city','')}, {ctx.get('country','')}")
+    if ctx.get('capacity') is not None:
+        lines.append(f"- capacity: {ctx['capacity']}")
+    if ctx.get('avg_ticket_price') is not None:
+        lines.append(f"- avg_ticket_price: {ctx['avg_ticket_price']} (local currency, if known)")
+    if ctx.get('annual_visitors') is not None:
+        lines.append(f"- annual_visitors: {ctx['annual_visitors']}")
+    if ctx.get('source_url'):
+        lines.append(f"- source_url: {ctx['source_url']}")
+    if ctx.get('notes'):
+        lines.append(f"- notes: {ctx['notes']}")
+    lines.append("")
+    lines.append("Return only JSON with: revenue_usd, confidence, assumptions.")
+    return "\n".join(lines)

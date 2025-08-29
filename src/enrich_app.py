@@ -1,11 +1,6 @@
 # src/enrich_app.py
-import os
-import json
-import re
-import time
-import random
+import os, json, re, time, random, logging
 from typing import Any, Dict, Optional, Tuple, List
-
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 from openai import OpenAI
@@ -15,6 +10,7 @@ from decimal import Decimal
 from datetime import date, datetime
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # ---------------- Env ----------------
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -31,7 +27,7 @@ ROW_DELAY_MAX_MS = int(os.environ.get("ROW_DELAY_MAX_MS", "180"))
 
 # ---------------- Clients ----------------
 bq = bigquery.Client(project=PROJECT_ID)
-oai = OpenAI()  # reads OPENAI_API_KEY from env (Secret Manager, etc.)
+oai = OpenAI()  # uses OPENAI_API_KEY from env/Secret Manager
 
 # ---------------- Helpers ----------------
 def _table_fq() -> str:
@@ -52,18 +48,19 @@ def fetch_page_text(url: Optional[str], timeout_sec: int = 8, max_chars: int = 6
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         return soup.get_text(" ", strip=True)[:max_chars]
-    except Exception:
+    except Exception as e:
+        logging.warning("scrape failed for %s: %s", url, repr(e))
         return ""
 
 def safe_json_from_text(txt: str) -> Optional[Dict[str, Any]]:
-    # try strict parse first
+    # strict attempt
     try:
         if isinstance(txt, dict):
             return txt
         return json.loads(txt)
     except Exception:
         pass
-    # fallback: extract first {...}
+    # fallback: first {...}
     if not isinstance(txt, str):
         return None
     m = re.search(r"\{.*\}", txt, re.DOTALL)
@@ -75,7 +72,6 @@ def safe_json_from_text(txt: str) -> Optional[Dict[str, Any]]:
         return None
 
 def to_json_safe(x):
-    """Convert BQ Decimals, datetimes, etc. into JSON-safe primitives."""
     if isinstance(x, Decimal):
         return float(x)
     if isinstance(x, (datetime, date)):
@@ -97,95 +93,7 @@ def baseline_revenue(avg_price, capacity, freq_per_year) -> Optional[float]:
     except Exception:
         return None
 
-# ---------------- GPT (tool calling) ----------------
-_TOOL_SPEC = [
-    {
-        "type": "function",
-        "function": {
-            "name": "set_estimates",
-            "description": "Return the final estimates for annual ticket revenue and RFP detection.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "revenue": {"type": "number", "description": "Estimated annual ticket revenue (>0)."},
-                    "currency": {"type": ["string", "null"], "description": "Currency code (e.g., USD, EUR) or null if unknown."},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Confidence in the revenue estimate (0..1)."},
-                    "rfp_detected": {"type": "boolean", "description": "Whether the org is soliciting RFPs."},
-                    "rationale": {"type": "string", "description": "≤280 chars rationale."}
-                },
-                "required": ["revenue", "confidence", "rfp_detected"]
-            }
-        }
-    }
-]
-
-def _coerce_tool_arguments(args) -> Dict[str, Any]:
-    """
-    OpenAI python 1.x sometimes returns function.arguments as a dict (already parsed),
-    others as a JSON string. Normalize both.
-    """
-    if args is None:
-        return {}
-    if isinstance(args, dict):
-        return args
-    if isinstance(args, str):
-        try:
-            return json.loads(args)
-        except Exception:
-            m = re.search(r"\{.*\}", args, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except Exception:
-                    return {}
-            return {}
-    # if the SDK ever returns other JSON-native types
-    return {}
-
-def chat_tools_json(system_text: str, user_payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Call Chat Completions with tool calling. Supports both dict and str tool arguments.
-    Returns: (json_or_none, raw_text_or_reason)
-    """
-    try:
-        safe_payload = to_json_safe(user_payload)
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_text},
-                {"role": "user", "content": json.dumps(safe_payload, ensure_ascii=False)},
-                {"role": "system", "content": "You MUST call the function set_estimates with your final answer."}
-            ],
-            tools=_TOOL_SPEC,
-            tool_choice="auto",
-            temperature=0.2,
-        )
-
-        choice = resp.choices[0]
-        msg = choice.message
-
-        # Preferred: tool call
-        tool_calls = getattr(msg, "tool_calls", None)
-        if tool_calls:
-            for tc in tool_calls:
-                if getattr(tc, "type", None) == "function" and getattr(tc, "function", None):
-                    if getattr(tc.function, "name", None) == "set_estimates":
-                        raw_args = getattr(tc.function, "arguments", None)
-                        data = _coerce_tool_arguments(raw_args)
-                        if isinstance(data, dict) and data:
-                            return data, "tool_call_ok"
-                        return None, f"ToolArgsParseError:{type(raw_args).__name__}"
-
-        # Fallback: try message content as JSON
-        content = msg.content or ""
-        data = safe_json_from_text(content)
-        if data:
-            return data, "content_json_ok"
-
-        return None, "no_tool_call_and_no_json"
-    except Exception as e:
-        return None, f"{type(e).__name__}:{str(e)[:300]}"
-
+# ---------------- GPT (JSON mode, no tools) ----------------
 def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
     """
     Returns: (revenue, currency, confidence, rfp_detected, rationale)
@@ -197,7 +105,7 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
     system_msg = (
         "You are a data quality assistant for performing arts organizations. "
         "Estimate ANNUAL ticket revenues realistically and detect if the organization is actively soliciting RFPs. "
-        "If you only have partial information, make a conservative estimate; avoid unrealistic numbers."
+        "Be conservative and avoid unrealistic numbers. Respond ONLY with a single JSON object."
     )
     user_payload = {
         "organization": {
@@ -214,16 +122,55 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
             "current_revenues_source": row.get("revenues_source"),
         },
         "website_text_snippet": (website_text or "")[:3000],
-        "instructions": (
-            "Return via function call set_estimates with keys: "
-            "revenue(number), currency(string|null), confidence(number 0..1), "
-            "rfp_detected(boolean), rationale(string <= 280 chars)."
-        ),
+        "output_schema": {
+            "revenue": "number (> 0)",
+            "currency": "string or null (e.g., USD, EUR, GBP)",
+            "confidence": "number between 0 and 1",
+            "rfp_detected": "boolean",
+            "rationale": "string, <= 280 chars"
+        }
     }
 
-    data, raw = chat_tools_json(system_msg, user_payload)
-    if not data:
-        return None, None, None, None, f"gpt_err:{raw or 'no_json'}"
+    try:
+        # 1) Try JSON mode (best path)
+        resp = oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": json.dumps(to_json_safe(user_payload), ensure_ascii=False)},
+            ],
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content or ""
+        data = safe_json_from_text(content)
+        if not data:
+            raise ValueError("json_mode_return_not_parseable")
+
+    except Exception as e1:
+        # 2) Fallback: classic prompting, then parse first {...}
+        try:
+            resp2 = oai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {
+                        "role": "user",
+                        "content": (
+                            json.dumps(to_json_safe(user_payload), ensure_ascii=False)
+                            + "\n\nReturn ONLY strict JSON with keys: "
+                              "revenue,currency,confidence,rfp_detected,rationale"
+                        ),
+                    },
+                ],
+                temperature=0.2,
+            )
+            content = resp2.choices[0].message.content or ""
+            data = safe_json_from_text(content)
+            if not data:
+                return None, None, None, None, f"gpt_err:fallback_no_json:{str(e1)[:120]}"
+        except Exception as e2:
+            return None, None, None, None, f"gpt_err:{type(e2).__name__}:{str(e2)[:160]} | first:{type(e1).__name__}:{str(e1)[:120]}"
 
     try:
         revenue = data.get("revenue")
@@ -237,7 +184,7 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
         rfp_val = bool(rfp_detected) if isinstance(rfp_detected, bool) else None
         return rev_val, currency, conf_val, rfp_val, rationale or "ok"
     except Exception as e:
-        return None, None, None, None, f"gpt_err:{type(e).__name__}:{str(e)[:200]}"
+        return None, None, None, None, f"gpt_err:parse:{type(e).__name__}:{str(e)[:160]}"
 
 # ---------------- DB writes ----------------
 def update_row(name_key: str, revenues, rfp_detected, rev_source_note):
@@ -257,16 +204,11 @@ def update_row(name_key: str, revenues, rfp_detected, rev_source_note):
     run_query(sql, params)
 
 def pick_quality_candidates(limit: int, force_all: bool = False):
-    """
-    Pick rows whose revenues exist (fallback or otherwise) and/or rfp_detected is missing,
-    so we can improve them with GPT.
-    """
     where_parts = [
         "(enrichment_status IS NULL OR enrichment_status != 'LOCKED')",
         "revenues IS NOT NULL"
     ]
     if not force_all:
-        # prioritize rows with fallback revenues and/or missing rfp_detected
         where_parts.append("(revenues_source LIKE 'sql-fallback%' OR rfp_detected IS NULL)")
     where_sql = " AND ".join(where_parts)
     sql = f"""
@@ -311,7 +253,6 @@ def version():
 
 @app.get("/quality")
 def quality():
-    # Query params
     try:
         limit = int(request.args.get("limit", "20"))
     except Exception:
@@ -343,7 +284,7 @@ def quality():
                 "overwrite_revenues": overwrite,
                 "rfp_detected_new": rfp_new,
                 "confidence": conf,
-                "reason": (reason or "")[:200],
+                "reason": (reason or "")[:240],  # include actual error text now
             })
         else:
             if overwrite or (rfp_new is not None and rfp_new != r.get("rfp_detected")):
@@ -356,7 +297,6 @@ def quality():
         else:
             skipped += 1
 
-        # polite pacing
         time.sleep(random.randint(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
 
     return jsonify({

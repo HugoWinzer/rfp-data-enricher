@@ -1,11 +1,22 @@
-# syntax=docker/dockerfile:1.4
+# Step 1: Use official Python image
 FROM python:3.11-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+# Step 2: Set working directory
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc curl && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r /app/requirements.txt
-COPY src /app/src
-ENV PYTHONPATH=/app
+
+# Step 3: Copy dependency list and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Step 4: Copy all project files into container
+COPY . .
+
+# Step 5: Set environment variables (Cloud Run overrides these with secrets/envs)
+ENV PORT=8080
+ENV HOST=0.0.0.0
+
+# Step 6: Expose port for Cloud Run
 EXPOSE 8080
-CMD exec gunicorn src.enrich_app:app --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 8 --timeout 120
+
+# Step 7: Run the app
+CMD ["python", "enrich_app.py"]

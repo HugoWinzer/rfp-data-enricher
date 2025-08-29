@@ -1,132 +1,165 @@
-# enrich_app.py (updated to improve revenue estimation with GPT)
+import os
+import json
+import time
+import logging
+from datetime import datetime, timezone
 
-import os, json, re, time, random, logging
-from typing import Any, Dict, Optional, Tuple, List
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
-from openai import OpenAI
-import requests
-from bs4 import BeautifulSoup
-from decimal import Decimal
-from datetime import date, datetime
 
-app = Flask(__name__)
+from gpt_client import ask_gpt, GPTResult
+from revenue_prompt import SYSTEM_PROMPT, build_user_prompt
+
 logging.basicConfig(level=logging.INFO)
+app = Flask(__name__)
 
-PROJECT_ID = os.environ.get("PROJECT_ID")
-DATASET_ID = os.environ.get("DATASET_ID", "rfpdata")
-TABLE = os.environ.get("TABLE", "OUTPUT")
-BQ_LOCATION = os.environ.get("BQ_LOCATION", "europe-southwest1")
+PROJECT_ID = os.getenv("PROJECT_ID", "rfp-database-464609")
+DATASET_ID = os.getenv("DATASET_ID", "rfpdata")
+TABLE = os.getenv("TABLE", "OUTPUT")
+BQ_LOCATION = os.getenv("BQ_LOCATION", "europe-southwest1")
+STOP_ON_GPT_QUOTA = os.getenv("STOP_ON_GPT_QUOTA", "1") == "1"
 
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-QUALITY_MIN_CONF = float(os.environ.get("QUALITY_MIN_CONF", "0.60"))
-DEFAULT_LOAD_FACTOR = float(os.environ.get("DEFAULT_LOAD_FACTOR", "0.70"))
+client = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
 
-ROW_DELAY_MIN_MS = int(os.environ.get("ROW_DELAY_MIN_MS", "30"))
-ROW_DELAY_MAX_MS = int(os.environ.get("ROW_DELAY_MAX_MS", "180"))
+PENDING_QUERY = f"""
+SELECT
+  name, domain,
+  CAST(capacity AS FLOAT64) AS capacity,
+  CAST(avg_ticket_price AS FLOAT64) AS avg_ticket_price,
+  city, country, run_dates, source_url,
+  Revenues
+FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE}`
+WHERE (Revenues IS NULL)
+  AND (enrichment_status IS NULL OR enrichment_status != 'LOCKED')
+LIMIT @limit
+"""
 
-bq = bigquery.Client(project=PROJECT_ID)
-oai = OpenAI()
-
-def _table_fq() -> str:
-    return f"`{PROJECT_ID}.{DATASET_ID}.{TABLE}`"
-
-def run_query(sql: str, params: Optional[List[bigquery.ScalarQueryParameter]] = None):
-    job_config = bigquery.QueryJobConfig()
-    if params:
-        job_config.query_parameters = params
-    job = bq.query(sql, job_config=job_config, location=BQ_LOCATION)
-    return job.result()
-
-def fetch_page_text(url: Optional[str], timeout_sec: int = 8, max_chars: int = 6000) -> str:
-    if not url:
-        return ""
-    try:
-        r = requests.get(url, timeout=timeout_sec, headers={"User-Agent": "rfp-quality/1.0"})
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        return soup.get_text(" ", strip=True)[:max_chars]
-    except Exception as e:
-        logging.warning("scrape failed for %s: %s", url, repr(e))
-        return ""
-
-def safe_json_from_text(txt: str) -> Optional[Dict[str, Any]]:
-    try:
-        return json.loads(txt) if isinstance(txt, str) else txt
-    except Exception:
-        m = re.search(r"\{.*\}", txt, re.DOTALL)
-        return json.loads(m.group(0)) if m else None
-
-def to_json_safe(x):
-    if isinstance(x, Decimal): return float(x)
-    if isinstance(x, (datetime, date)): return x.isoformat()
-    if isinstance(x, dict): return {k: to_json_safe(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)): return [to_json_safe(v) for v in x]
-    return x
-
-def baseline_revenue(avg_price, capacity, freq_per_year) -> Optional[float]:
-    try:
-        return round(float(avg_price) * float(capacity) * float(freq_per_year) * DEFAULT_LOAD_FACTOR, 2)
-    except Exception:
-        return None
-
-def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
-    website_text = fetch_page_text(row.get("website_url"))
-    base = baseline_revenue(row.get("avg_ticket_price"), row.get("capacity"), row.get("frequency_per_year"))
-
-    system_msg = (
-        "You are a data enrichment agent estimating realistic ANNUAL ticket revenue.\n"
-        "Use average ticket price, capacity, and event frequency when available,\n"
-        "or infer heuristically from website text. Respond ONLY with strict JSON: \n"
-        "revenue, currency, confidence, rfp_detected, rationale."
+def update_row(name: str, revenues: float, source: str, notes: str, status: str = "OK"):
+    table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE}"
+    query = f"""
+    UPDATE `{table_ref}`
+    SET Revenues=@revenues,
+        revenues_source=@source,
+        revenues_notes=@notes,
+        enrichment_status=@status,
+        last_updated=CURRENT_TIMESTAMP()
+    WHERE name=@name
+    """
+    job = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("revenues", "NUMERIC", revenues),
+                bigquery.ScalarQueryParameter("source", "STRING", source),
+                bigquery.ScalarQueryParameter("notes", "STRING", notes[:1500] if notes else None),
+                bigquery.ScalarQueryParameter("status", "STRING", status),
+                bigquery.ScalarQueryParameter("name", "STRING", name),
+            ]
+        ),
     )
+    job.result()
 
-    user_payload = {
-        "organization": {
-            "name": row.get("name"),
-            "domain": row.get("domain"),
-            "website_url": row.get("website_url"),
-        },
-        "known_fields": {
-            "avg_ticket_price": row.get("avg_ticket_price"),
-            "capacity": row.get("capacity"),
-            "frequency_per_year": row.get("frequency_per_year"),
-            "baseline_revenue_estimate": base,
-            "current_revenues": row.get("revenues"),
-            "current_revenues_source": row.get("revenues_source"),
-        },
-        "website_text_snippet": website_text[:3000],
-        "output_schema": {
-            "revenue": "number (> 0)",
-            "currency": "string or null",
-            "confidence": "number between 0 and 1",
-            "rfp_detected": "boolean",
-            "rationale": "string, <= 280 chars"
+@app.get("/ping")
+def ping():
+    return "pong"
+
+@app.get("/ready")
+def ready():
+    return "ok"
+
+@app.get("/")
+def run_batch():
+    """
+    GET /?limit=N&dry=1
+    - Picks rows with Revenues IS NULL
+    - Builds a structured prompt using existing capacity/avg_ticket_price as hints
+    - Calls GPT and writes Revenues back to BigQuery
+    """
+    try:
+        limit = int(request.args.get("limit", "20"))
+    except ValueError:
+        limit = 20
+    dry = request.args.get("dry") in ("1", "true", "True")
+
+    job = client.query(
+        PENDING_QUERY,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("limit", "INT64", limit)]
+        ),
+    )
+    rows = list(job.result())
+    processed = 0
+    results = []
+
+    for r in rows:
+        name = r["name"]
+        row_ctx = {
+            "name": r.get("name"),
+            "domain": r.get("domain"),
+            "capacity": r.get("capacity"),
+            "avg_ticket_price": r.get("avg_ticket_price"),
+            "city": r.get("city"),
+            "country": r.get("country"),
+            "run_dates": r.get("run_dates"),
+            "extra_context": r.get("source_url"),
         }
-    }
+        user_prompt = build_user_prompt(row_ctx)
 
-    try:
-        resp = oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": json.dumps(to_json_safe(user_payload), ensure_ascii=False)},
-            ],
-            temperature=0.2,
-        )
-        content = resp.choices[0].message.content or ""
-        data = safe_json_from_text(content)
-        if not data:
-            raise ValueError("GPT returned non-JSON format")
-    except Exception as e:
-        return None, None, None, None, f"gpt_err:{type(e).__name__}:{str(e)[:160]}"
+        try:
+            gpt_result: GPTResult = ask_gpt(SYSTEM_PROMPT, user_prompt)
+            data = json.loads(gpt_result.text)
+            revenue_val = float(data.get("revenue_usd"))
+            confidence = str(data.get("confidence", ""))
+            assumptions = str(data.get("assumptions", ""))[:1000]
+            note = f"confidence={confidence}; assumptions={assumptions}"
 
-    try:
-        revenue = float(data.get("revenue", 0)) or None
-        confidence = float(data.get("confidence", 0)) or None
-        return revenue, data.get("currency"), confidence, bool(data.get("rfp_detected")), data.get("rationale")
-    except Exception as e:
-        return None, None, None, None, f"gpt_parse_error:{type(e).__name__}:{str(e)[:160]}"
+            if dry:
+                results.append(
+                    {"name": name, "revenues_dry": revenue_val, "notes": note}
+                )
+            else:
+                update_row(
+                    name=name,
+                    revenues=revenue_val,
+                    source="GPT",
+                    notes=note,
+                    status="OK",
+                )
+                results.append({"name": name, "revenues": revenue_val})
+                processed += 1
 
-# ... rest of file unchanged (routes, update_row, pick_quality_candidates, etc)
+        except RuntimeError as e:
+            # This captures OpenAI 429 quota stops.
+            if "429" in str(e) and STOP_ON_GPT_QUOTA:
+                logging.error("GPT quota hit (429). Stopping batch.")
+                return jsonify(
+                    {
+                        "status": "stopped_on_quota",
+                        "processed": processed,
+                        "error": str(e),
+                    }
+                ), 429
+            logging.exception("GPT error")
+            if not dry:
+                # Mark row as attempted but leave Revenues NULL
+                update_row(
+                    name=name,
+                    revenues=None,
+                    source="GPT",
+                    notes=f"error: {str(e)[:900]}",
+                    status="ERROR",
+                )
+            results.append({"name": name, "error": str(e)})
+        except Exception as e:
+            logging.exception("Unhandled error")
+            if not dry:
+                update_row(
+                    name=name,
+                    revenues=None,
+                    source="GPT",
+                    notes=f"error: {str(e)[:900]}",
+                    status="ERROR",
+                )
+            results.append({"name": name, "error": str(e)})
+
+    return jsonify({"status": "ok", "processed": processed, "items": results})

@@ -1,0 +1,23 @@
+CREATE TABLE IF NOT EXISTS `rfp-database-464609.rfpdata.performing_arts_madrid` (
+  name STRING,
+  domain STRING,
+  city STRING,
+  country STRING,
+  source_url STRING,
+  capacity NUMERIC,
+  avg_ticket_price NUMERIC,
+  category STRING,
+  sub_category STRING,
+  website STRING,
+  ticket_vendor STRING,
+  annual_visitors NUMERIC,
+  capacity_final NUMERIC,
+  atp NUMERIC,
+  gtv NUMERIC,
+  size_segment STRING,
+  ownership STRING,
+  rfp STRING,
+  enrichment_status STRING,
+  notes STRING,
+  last_updated TIMESTAMP
+);

@@ -1,15 +1,13 @@
-cd ~/rfp-data-enricher
 cp src/enrich_app.py src/enrich_app.backup.$(date +%Y%m%d_%H%M%S).py
 
 cat > src/enrich_app.py <<'PY'
 import os, json, re, time, random
 from typing import Any, Dict, Optional, Tuple
-from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from google.cloud import bigquery
 from openai import OpenAI
+import requests
+from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
@@ -27,13 +25,12 @@ ROW_DELAY_MAX_MS = int(os.environ.get("ROW_DELAY_MAX_MS", "180"))
 
 # ---- Clients ----
 bq = bigquery.Client(project=PROJECT_ID)
-oai = OpenAI()  # uses OPENAI_API_KEY from Secret Manager
+oai = OpenAI()  # OPENAI_API_KEY from Secret Manager
 
-# ---- Utils ----
 def _table_fq() -> str:
     return f"`{PROJECT_ID}.{DATASET_ID}.{TABLE}`"
 
-def run_query(sql: str, params: Optional[list] = None):
+def run_query(sql: str, params=None):
     job_config = bigquery.QueryJobConfig()
     if params:
         job_config.query_parameters = params
@@ -41,10 +38,9 @@ def run_query(sql: str, params: Optional[list] = None):
     return job.result()
 
 def fetch_page_text(url: Optional[str], timeout_sec: int = 8, max_chars: int = 6000) -> str:
-    if not url:
-        return ""
+    if not url: return ""
     try:
-        r = requests.get(url, timeout=timeout_sec, headers={"User-Agent": "rfp-data-enricher/quality-pass"})
+        r = requests.get(url, timeout=timeout_sec, headers={"User-Agent": "rfp-quality/1.0"})
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         return soup.get_text(" ", strip=True)[:max_chars]
@@ -53,14 +49,13 @@ def fetch_page_text(url: Optional[str], timeout_sec: int = 8, max_chars: int = 6
 
 def safe_json_from_text(txt: str) -> Optional[Dict[str, Any]]:
     m = re.search(r"\{.*\}", txt, re.DOTALL)
-    if not m:
-        return None
+    if not m: return None
     try:
         return json.loads(m.group(0))
     except Exception:
         return None
 
-def baseline_revenue(avg_price: Optional[float], capacity: Optional[int], freq_per_year: Optional[int]) -> Optional[float]:
+def baseline_revenue(avg_price, capacity, freq_per_year):
     try:
         if avg_price is None or capacity is None or freq_per_year is None:
             return None
@@ -68,7 +63,7 @@ def baseline_revenue(avg_price: Optional[float], capacity: Optional[int], freq_p
     except Exception:
         return None
 
-def gpt_improve_revenue_and_rfp(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[float], Optional[bool], str]:
+def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
     """
     Returns: (revenue, currency, confidence, rfp_detected, rationale)
     Only use revenue when confidence >= QUALITY_MIN_CONF and revenue > 0.
@@ -76,11 +71,8 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]) -> Tuple[Optional[float], O
     website_text = fetch_page_text(row.get("website_url"))
     base = baseline_revenue(row.get("avg_ticket_price"), row.get("capacity"), row.get("frequency_per_year"))
 
-    sys = (
-        "You are a data quality assistant for performing arts organizations. "
-        "Estimate ANNUAL ticket revenues realistically from provided fields and website text. "
-        "Detect if the organization is actively soliciting RFPs. Be conservative and avoid overestimates."
-    )
+    sys = ("You are a data quality assistant for performing arts organizations. "
+           "Estimate ANNUAL ticket revenues realistically and detect if the org is soliciting RFPs.")
     usr = {
         "organization": {
             "name": row.get("name"),
@@ -96,12 +88,8 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]) -> Tuple[Optional[float], O
             "current_revenues_source": row.get("revenues_source"),
         },
         "website_text_snippet": website_text[:3000],
-        "instructions": (
-            "Return strict JSON with keys: "
-            "revenue(number), currency(string|null), confidence(number 0..1), "
-            "rfp_detected(boolean), rationale(string <= 280 chars). "
-            "Revenue = annual ticketing revenue."
-        ),
+        "instructions": ("Return strict JSON with keys: revenue(number), currency(string|null), "
+                         "confidence(number 0..1), rfp_detected(boolean), rationale(string <= 280 chars).")
     }
 
     try:
@@ -113,27 +101,22 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]) -> Tuple[Optional[float], O
         )
         content = resp.choices[0].message.content or ""
         data = safe_json_from_text(content)
-        if not data:
-            return None, None, None, None, "no_json"
+        if not data: return None, None, None, None, "no_json"
 
-        revenue = data.get("revenue")
-        currency = data.get("currency")
-        confidence = data.get("confidence")
-        rfp_detected = data.get("rfp_detected")
-        rationale = (data.get("rationale") or "")[:280]
+        revenue     = data.get("revenue")
+        currency    = data.get("currency")
+        confidence  = data.get("confidence")
+        rfp_detected= data.get("rfp_detected")
+        rationale   = (data.get("rationale") or "")[:280]
 
         rev_val = float(revenue) if isinstance(revenue, (int, float)) and revenue > 0 else None
         conf_val = float(confidence) if isinstance(confidence, (int, float)) else None
         rfp_val = bool(rfp_detected) if isinstance(rfp_detected, bool) else None
-
         return rev_val, currency, conf_val, rfp_val, rationale or "ok"
     except Exception as e:
         return None, None, None, None, f"gpt_err:{type(e).__name__}"
 
-def update_row(name_key: str,
-               revenues: Optional[float],
-               rfp_detected: Optional[bool],
-               rev_source_note: Optional[str]) -> None:
+def update_row(name_key: str, revenues, rfp_detected, rev_source_note):
     sets = ["last_updated = CURRENT_TIMESTAMP()"]
     params = [bigquery.ScalarQueryParameter("name", "STRING", name_key)]
     if revenues is not None:
@@ -145,7 +128,6 @@ def update_row(name_key: str,
     if rev_source_note is not None:
         sets.append("revenues_source = @src")
         params.append(bigquery.ScalarQueryParameter("src", "STRING", rev_source_note))
-
     sql = f"UPDATE {_table_fq()} SET {', '.join(sets)} WHERE name = @name"
     run_query(sql, params)
 
@@ -157,12 +139,10 @@ def pick_quality_candidates(limit: int, force_all: bool = False):
     if not force_all:
         where_parts.append("(revenues_source LIKE 'sql-fallback%' OR rfp_detected IS NULL)")
     where_sql = " AND ".join(where_parts)
-
     sql = f"""
-    SELECT
-      name, domain, website_url,
-      avg_ticket_price, capacity, frequency_per_year,
-      revenues, revenues_source, rfp_detected
+    SELECT name, domain, website_url,
+           avg_ticket_price, capacity, frequency_per_year,
+           revenues, revenues_source, rfp_detected
     FROM {_table_fq()}
     WHERE {where_sql}
     ORDER BY last_updated ASC
@@ -171,27 +151,22 @@ def pick_quality_candidates(limit: int, force_all: bool = False):
     rows = run_query(sql, [bigquery.ScalarQueryParameter("limit", "INT64", limit)])
     return [dict(r) for r in rows]
 
-# ------------- Endpoints -------------
-
+# --------- Endpoints ---------
 @app.get("/ping")
 def ping():
-    return "ok"  # keep your historical behavior
+    return "ok"
 
 @app.get("/ready")
 def ready():
     return jsonify({"ready": True, "bq_location": BQ_LOCATION})
 
+@app.get("/routes")
+def routes():
+    # quick introspection aid
+    return jsonify(sorted([r.rule for r in app.url_map.iter_rules()]))
+
 @app.get("/quality")
 def quality():
-    """
-    Quality pass:
-      - Try to improve revenues via GPT (overwrite only if confidence >= QUALITY_MIN_CONF).
-      - Fill rfp_detected when missing or changed.
-    Query params:
-      limit: int (default 20)
-      dry: 1 to simulate only
-      force_all: 1 to consider all rows with non-null revenues (not only sql-fallback/missing rfp)
-    """
     try:
         limit = int(request.args.get("limit", "20"))
     except Exception:
@@ -200,10 +175,7 @@ def quality():
     force_all = request.args.get("force_all") == "1"
 
     rows = pick_quality_candidates(limit, force_all=force_all)
-    improved = 0
-    only_rfp = 0
-    processed = 0
-    skipped = 0
+    improved = only_rfp = processed = skipped = 0
     details = []
 
     for r in rows:
@@ -238,7 +210,6 @@ def quality():
         else:
             skipped += 1
 
-        # gentle pacing
         time.sleep(random.randint(ROW_DELAY_MIN_MS, ROW_DELAY_MAX_MS) / 1000.0)
 
     return jsonify({

@@ -56,12 +56,12 @@ def fetch_page_text(url: Optional[str], timeout_sec: int = 8, max_chars: int = 6
         return ""
 
 def safe_json_from_text(txt: str) -> Optional[Dict[str, Any]]:
-    # try strict json first
+    # strict attempt
     try:
         return json.loads(txt)
     except Exception:
         pass
-    # fallback: extract first {...}
+    # fallback: first {...}
     m = re.search(r"\{.*\}", txt, re.DOTALL)
     if not m:
         return None
@@ -71,9 +71,8 @@ def safe_json_from_text(txt: str) -> Optional[Dict[str, Any]]:
         return None
 
 def to_json_safe(x):
-    """Convert BigQuery Decimals, datetimes, etc. into JSON-safe types."""
+    """Convert BQ Decimals, datetimes, etc. into JSON-safe primitives."""
     if isinstance(x, Decimal):
-        # Use float for model consumption (you can swap to str(x) if you prefer exactness)
         return float(x)
     if isinstance(x, (datetime, date)):
         return x.isoformat()
@@ -94,29 +93,70 @@ def baseline_revenue(avg_price, capacity, freq_per_year) -> Optional[float]:
     except Exception:
         return None
 
-def oai_json(system_text: str, user_payload: Dict[str, Any], temperature: float = 0.2) -> Tuple[Optional[Dict[str, Any]], str]:
+# ---------------- GPT (tool calling) ----------------
+_TOOL_SPEC = [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_estimates",
+            "description": "Return the final estimates for annual ticket revenue and RFP detection.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "revenue": {"type": "number", "description": "Estimated annual ticket revenue (>0)."},
+                    "currency": {"type": ["string", "null"], "description": "Currency code (e.g., USD, EUR) or null if unknown."},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Confidence in the revenue estimate (0..1)."},
+                    "rfp_detected": {"type": "boolean", "description": "Whether the org is soliciting RFPs."},
+                    "rationale": {"type": "string", "description": "≤280 chars rationale."}
+                },
+                "required": ["revenue", "confidence", "rfp_detected"]
+            }
+        }
+    }
+]
+
+def chat_tools_json(system_text: str, user_payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    Call OpenAI Responses API, ask for a JSON object back.
-    Returns: (parsed_json | None, raw_text_or_error)
+    Call Chat Completions with tool calling. If the model calls the tool, parse args as JSON.
+    Returns: (json_or_none, raw_text_or_error)
     """
     try:
         safe_payload = to_json_safe(user_payload)
-        resp = oai.responses.create(
+        resp = oai.chat.completions.create(
             model=OPENAI_MODEL,
-            input=[
+            messages=[
                 {"role": "system", "content": system_text},
-                {"role": "user", "content": json.dumps(safe_payload, ensure_ascii=False)}
+                {"role": "user", "content": json.dumps(safe_payload, ensure_ascii=False)},
+                {"role": "system", "content": "You MUST call the function set_estimates with your final answer."}
             ],
-            temperature=temperature,
-            response_format={"type": "json_object"},
+            tools=_TOOL_SPEC,
+            tool_choice="auto",
+            temperature=0.2,
         )
-        raw = (getattr(resp, "output_text", None) or "").strip()
-        data = safe_json_from_text(raw) if raw else None
-        return data, (raw or "")
-    except Exception as e:
-        return None, f"{type(e).__name__}: {str(e)[:300]}"
 
-# ---------------- GPT logic ----------------
+        choice = resp.choices[0]
+        msg = choice.message
+
+        # Preferred path: tool call with JSON args
+        if getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                if tc.type == "function" and tc.function and tc.function.name == "set_estimates":
+                    args_str = tc.function.arguments or "{}"
+                    try:
+                        data = json.loads(args_str)
+                        return data, args_str
+                    except Exception as e:
+                        return None, f"ToolArgsJSONError:{str(e)[:200]}"
+
+        # Fallback: parse message content as JSON (should be rare)
+        content = msg.content or ""
+        data = safe_json_from_text(content)
+        if data:
+            return data, content
+        return None, content or "no_content"
+    except Exception as e:
+        return None, f"{type(e).__name__}:{str(e)[:300]}"
+
 def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
     """
     Returns: (revenue, currency, confidence, rfp_detected, rationale)
@@ -146,13 +186,13 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
         },
         "website_text_snippet": (website_text or "")[:3000],
         "instructions": (
-            "Return strict JSON with keys: "
+            "Return via function call set_estimates with keys: "
             "revenue(number), currency(string|null), confidence(number 0..1), "
             "rfp_detected(boolean), rationale(string <= 280 chars)."
         ),
     }
 
-    data, raw = oai_json(system_msg, user_payload, temperature=0.2)
+    data, raw = chat_tools_json(system_msg, user_payload)
     if not data:
         return None, None, None, None, f"gpt_err:{raw or 'no_json'}"
 
@@ -170,6 +210,7 @@ def gpt_improve_revenue_and_rfp(row: Dict[str, Any]):
     except Exception as e:
         return None, None, None, None, f"gpt_err:{type(e).__name__}:{str(e)[:200]}"
 
+# ---------------- DB writes ----------------
 def update_row(name_key: str, revenues, rfp_detected, rev_source_note):
     sets = ["last_updated = CURRENT_TIMESTAMP()"]
     params: List[bigquery.ScalarQueryParameter] = [bigquery.ScalarQueryParameter("name", "STRING", name_key)]
@@ -273,7 +314,7 @@ def quality():
                 "overwrite_revenues": overwrite,
                 "rfp_detected_new": rfp_new,
                 "confidence": conf,
-                "reason": (reason or "")[:160],
+                "reason": (reason or "")[:200],
             })
         else:
             if overwrite or (rfp_new is not None and rfp_new != r.get("rfp_detected")):

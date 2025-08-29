@@ -1,4 +1,3 @@
-# src/revenue_prompt.py
 SYSTEM_PROMPT = """You are a careful revenue estimator for cultural venues and events.
 Goal: estimate ANNUAL gross ticket revenue (GTV) in USD for the provided entity.
 Use provided hints (capacity, average ticket price, annual visitors, notes).

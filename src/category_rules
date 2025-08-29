@@ -1,0 +1,25 @@
+# src/category_rules.py
+from __future__ import annotations
+from typing import Optional, Tuple
+
+def infer_category_and_subcategory(name: str | None, domain: str | None) -> Tuple[Optional[str], Optional[str]]:
+    n = (name or "").lower()
+    d = (domain or "").lower()
+
+    # Music festivals
+    if any(k in n for k in ["festival", "fest", "rock in", "summer"]):
+        return "A - Music & Nightlife", "A1 - Festivals"
+
+    # Theatre/Opera
+    if any(k in n for k in ["teatro", "theatre", "theater", "opera"]):
+        return "B - Performing Arts", "B1 - Theatre/Opera"
+
+    # Museums
+    if any(k in n for k in ["museum", "museo", "galería", "galeria"]):
+        return "C - Museums", "C1 - General Museum"
+
+    # Venues/Arenas/Palacios
+    if any(k in n for k in ["auditorio", "auditorium", "center", "centre", "palacio", "arena"]):
+        return "B - Performing Arts", "B2 - Live Venues"
+
+    return None, None

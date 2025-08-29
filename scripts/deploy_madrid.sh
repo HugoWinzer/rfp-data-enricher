@@ -1,23 +1,15 @@
-# scripts/deploy_madrid.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-rfp-database-464609}"
 REGION="${REGION:-us-central1}"
-SERVICE="${SERVICE:-rfp-data-enricher-madrid}"
-BQ_LOCATION="${BQ_LOCATION:-europe-southwest1}"
+SERVICE="rfp-data-enricher-madrid"
+BQ_LOCATION="europe-southwest1"
 
 gcloud config set project "$PROJECT_ID"
 
-# Build with alt Dockerfile so your main service is untouched
-gcloud builds submit --tag "gcr.io/$PROJECT_ID/$SERVICE:latest" --gcs-log-dir="gs://$PROJECT_ID-cloudbuild-logs" --timeout=1200 \
-  --config <(cat <<'YAML'
-steps:
-- name: 'gcr.io/cloud-builders/docker'
-  args: ['build','-f','Dockerfile.madrid','-t','gcr.io/$PROJECT_ID/$SERVICE:latest','.']
-images: ['gcr.io/$PROJECT_ID/$SERVICE:latest']
-YAML
-)
+# Build image using alternate Dockerfile via Cloud Build config
+gcloud builds submit --config cloudbuild.madrid.yaml --substitutions=_SERVICE="$SERVICE"
 
 gcloud run deploy "$SERVICE" \
   --image "gcr.io/$PROJECT_ID/$SERVICE:latest" \
@@ -30,8 +22,7 @@ gcloud run deploy "$SERVICE" \
 SERVICE_URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
 echo "Service URL: $SERVICE_URL"
 
-# Smoke tests (same pattern as your base service)
+# Smoke tests (same endpoints as your main service)
 curl -sS "$SERVICE_URL/ping"; echo
 curl -sS "$SERVICE_URL/ready"; echo
 curl -sS "$SERVICE_URL/?limit=5&dry=1"; echo
-
